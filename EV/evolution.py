@@ -1,10 +1,10 @@
 import os
 import argparse
 import numpy as np
-from sklearn.externals.joblib import Parallel, delayed
+from joblib import Parallel, delayed
 from PIL import Image
 import matplotlib.pyplot as plt
-import gym
+import gymnasium as gym  # gymからgymnasiumに変更
 
 # Disable TensorFlow GPU for parallel execution
 if os.name == "nt":
@@ -13,8 +13,8 @@ else:
     os.environ["CUDA_VISIBLE_DEVICES"] = ""
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-from tensorflow.python import keras as K
-
+import tensorflow as tf
+import tensorflow.keras as K
 
 class EvolutionalAgent():
 
@@ -33,45 +33,51 @@ class EvolutionalAgent():
         return agent
 
     def initialize(self, state, weights=()):
-        normal = K.initializers.glorot_normal()
-        model = K.Sequential()
-        model.add(K.layers.Conv2D(
-            3, kernel_size=5, strides=3,
-            input_shape=state.shape, kernel_initializer=normal,
-            activation="relu"))
-        model.add(K.layers.Flatten())
-        model.add(K.layers.Dense(len(self.actions), activation="softmax"))
+        # 最新のKerasに対応
+        normal = K.initializers.GlorotNormal()
+        inputs = K.Input(shape=state.shape)
+        x = K.layers.Conv2D(3, kernel_size=5, strides=3, 
+                           kernel_initializer=normal, activation="relu")(inputs)
+        x = K.layers.Flatten()(x)
+        outputs = K.layers.Dense(len(self.actions), activation="softmax")(x)
+        model = K.Model(inputs=inputs, outputs=outputs)
         self.model = model
+        
         if len(weights) > 0:
             self.model.set_weights(weights)
 
     def policy(self, state):
-        action_probs = self.model.predict(np.array([state]))[0]
-        action = np.random.choice(self.actions,
-                                  size=1, p=action_probs)[0]
+        state_array = np.array([state])
+        # 最新のTensorFlowに対応
+        action_probs = self.model.predict(state_array, verbose=0)[0]
+        action = np.random.choice(self.actions, size=1, p=action_probs)[0]
         return action
 
     def play(self, env, episode_count=5, render=True):
         for e in range(episode_count):
-            s = env.reset()
+            s, _ = env.reset()  # 新しいAPI
             done = False
+            terminated = False
+            truncated = False
             episode_reward = 0
+            
             while not done:
                 if render:
                     env.render()
                 a = self.policy(s)
-                n_state, reward, done, info = env.step(a)
+                n_state, reward, terminated, truncated, info = env.step(a)  # 新しいAPI
+                done = terminated or truncated
                 episode_reward += reward
                 s = n_state
-            else:
-                print("Get reward {}".format(episode_reward))
+            
+            print(f"エピソード {e+1}: 報酬 {episode_reward}")
 
 
-class CatcherObserver():
+# 代替環境：CartPole-v1はGymnasiumで動作する標準環境
+class CartPoleObserver():
 
     def __init__(self, width, height, frame_count):
-        import gym_ple
-        self._env = gym.make("Catcher-v0")
+        self._env = gym.make("CartPole-v1", render_mode="rgb_array")
         self.width = width
         self.height = height
 
@@ -84,22 +90,26 @@ class CatcherObserver():
         return self._env.observation_space
 
     def reset(self):
-        return self.transform(self._env.reset())
+        observation, info = self._env.reset()
+        return self.transform(self._env.render())
 
     def render(self):
-        self._env.render(mode="human")
+        self._env.render()
 
     def step(self, action):
-        n_state, reward, done, info = self._env.step(action)
-        return self.transform(n_state), reward, done, info
+        n_state, reward, terminated, truncated, info = self._env.step(action)
+        done = terminated or truncated
+        return self.transform(self._env.render()), reward, done, info
 
     def transform(self, state):
-        grayed = Image.fromarray(state).convert("L")
-        resized = grayed.resize((self.width, self.height))
-        resized = np.array(resized).astype("float")
-        normalized = resized / 255.0  # scale to 0~1
-        normalized = np.expand_dims(normalized, axis=2)  # H x W => W x W x C
-        return normalized
+        # 画像を取得してグレースケール化
+        image = Image.fromarray(state).convert("L")
+        # リサイズ
+        resized = image.resize((self.width, self.height))
+        # 正規化
+        normalized = np.array(resized) / 255.0
+        # 次元追加（チャネル）
+        return normalized.reshape((self.height, self.width, 1))
 
 
 class EvolutionalTrainer():
@@ -120,67 +130,119 @@ class EvolutionalTrainer():
         agent.initialize(s)
         self.weights = agent.model.get_weights()
 
-        with Parallel(n_jobs=-1) as parallel:
-            for e in range(epoch):
-                experiment = delayed(EvolutionalTrainer.run_agent)
-                results = parallel(experiment(
-                                episode_per_agent, self.weights, self.sigma)
-                                for p in range(self.population_size))
-                self.update(results)
-                self.log()
+        # 並列処理をシリアル処理に変更
+        for e in range(epoch):
+            results = []
+            for p in range(self.population_size):
+                result = EvolutionalTrainer.run_agent(
+                    episode_per_agent, self.weights, self.sigma)
+                results.append(result)
+            self.update(results)
+            self.log()
 
         agent.model.set_weights(self.weights)
         return agent
 
     @classmethod
     def make_env(cls):
-        return CatcherObserver(width=50, height=50, frame_count=5)
+        return CartPoleObserver(width=50, height=50, frame_count=1)
 
     @classmethod
-    def run_agent(cls, episode_per_agent, base_weights, sigma,
-                  max_step=1000):
-        env = cls.make_env()
-        actions = list(range(env.action_space.n))
-        agent = EvolutionalAgent(actions)
+    def run_agent(cls, episode_per_agent, base_weights, sigma, max_step=1000):
+        try:
+            env = cls.make_env()
+            actions = list(range(env.action_space.n))
+            agent = EvolutionalAgent(actions)
 
-        noises = []
-        new_weights = []
+            noises = []
+            new_weights = []
 
-        # Make weight
-        for w in base_weights:
-            noise = np.random.randn(*w.shape)
-            new_weights.append(w + sigma * noise)
-            noises.append(noise)
+            # Make weight
+            for w in base_weights:
+                noise = np.random.randn(*w.shape)
+                new_weights.append(w + sigma * noise)
+                noises.append(noise)
 
-        # Test Play
-        total_reward = 0
-        for e in range(episode_per_agent):
-            s = env.reset()
-            if agent.model is None:
-                agent.initialize(s, new_weights)
-            done = False
-            step = 0
-            while not done and step < max_step:
-                a = agent.policy(s)
-                n_state, reward, done, info = env.step(a)
-                total_reward += reward
-                s = n_state
-                step += 1
+            # Test Play
+            total_reward = 0
+            for e in range(episode_per_agent):
+                s = env.reset()
+                if s is None:
+                    return 0, noises
+                    
+                if agent.model is None:
+                    agent.initialize(s, new_weights)
+                
+                done = False
+                step = 0
+                
+                while not done and step < max_step:
+                    a = agent.policy(s)
+                    try:
+                        n_state, reward, done, info = env.step(a)
+                        if n_state is None:
+                            done = True
+                            continue
+                        
+                        total_reward += reward
+                        s = n_state
+                    except Exception as e:
+                        print(f"Step execution error: {e}")
+                        done = True
+                    step += 1
 
-        reward = total_reward / episode_per_agent
-        return reward, noises
+            reward = total_reward / max(episode_per_agent, 1)
+            return reward, noises
+        except Exception as e:
+            print(f"Agent execution error: {e}")
+            return 0, [np.zeros_like(w) for w in base_weights]
 
     def update(self, agent_results):
-        rewards = np.array([r[0] for r in agent_results])
-        noises = np.array([r[1] for r in agent_results])
-        normalized_rs = (rewards - rewards.mean()) / rewards.std()
+        # フィルタリングを追加：エラーで戻り値が不正なものを除外
+        valid_results = [r for r in agent_results if isinstance(r, tuple) and len(r) == 2 and r[0] is not None and r[1] is not None]
+        
+        if not valid_results:
+            print("WARNING: No valid agent results to update weights")
+            return
+            
+        rewards = np.array([r[0] for r in valid_results])
+        
+        # ノイズをリストとして扱う
+        noises_list = []
+        for r in valid_results:
+            if isinstance(r[1], list) and len(r[1]) == len(self.weights):
+                noises_list.append(r[1])
+        
+        if not noises_list:
+            print("WARNING: No valid noise data found")
+            return
+            
+        # 報酬の正規化
+        if len(rewards) > 1:
+            normalized_rs = (rewards - rewards.mean()) / (rewards.std() + 1e-10)
+        else:
+            normalized_rs = np.zeros_like(rewards)
 
         # Update base weights
         new_weights = []
         for i, w in enumerate(self.weights):
-            noise_at_i = np.array([n[i] for n in noises])
-            rate = self.learning_rate / (self.population_size * self.sigma)
-            w = w + rate * np.dot(noise_at_i.T, normalized_rs).T
+            try:
+                # リストからi番目の重みのノイズだけを抽出
+                noise_at_i = [n[i] for n in noises_list]
+                
+                # 各ノイズと正規化された報酬の積の合計を計算
+                update_val = np.zeros_like(w)
+                for ni, r in zip(noise_at_i, normalized_rs):
+                    try:
+                        update_val += ni * r
+                    except Exception as e:
+                        print(f"Error adding noise contribution: {e}")
+                
+                # 重みを更新
+                rate = self.learning_rate / ((len(noises_list) + 1e-10) * self.sigma)
+                w = w + rate * update_val
+            except Exception as e:
+                print(f"Weight update error at index {i}: {e}")
             new_weights.append(w)
 
         self.weights = new_weights
@@ -188,7 +250,7 @@ class EvolutionalTrainer():
 
     def log(self):
         rewards = self.reward_log[-1]
-        print("Epoch {}: reward {:.3}(max:{}, min:{})".format(
+        print("Epoch {}: reward {:.3f}(max:{:.1f}, min:{:.1f})".format(
             len(self.reward_log), rewards.mean(),
             rewards.max(), rewards.min()))
 

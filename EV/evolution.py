@@ -33,12 +33,11 @@ class EvolutionalAgent():
         return agent
 
     def initialize(self, state, weights=()):
-        # 最新のKerasに対応
+        # シンプルなフィードフォワードネットワーク
         normal = K.initializers.GlorotNormal()
-        inputs = K.Input(shape=state.shape)
-        x = K.layers.Conv2D(3, kernel_size=5, strides=3, 
-                           kernel_initializer=normal, activation="relu")(inputs)
-        x = K.layers.Flatten()(x)
+        inputs = K.Input(shape=(len(state),))  # 状態ベクトルの次元
+        x = K.layers.Dense(24, activation="relu", kernel_initializer=normal)(inputs)
+        x = K.layers.Dense(24, activation="relu", kernel_initializer=normal)(x)
         outputs = K.layers.Dense(len(self.actions), activation="softmax")(x)
         model = K.Model(inputs=inputs, outputs=outputs)
         self.model = model
@@ -112,6 +111,32 @@ class CartPoleObserver():
         return normalized.reshape((self.height, self.width, 1))
 
 
+# CartPoleObserverの代わりにこちらを使用
+class CartPoleVectorObserver():
+    def __init__(self):
+        self._env = gym.make("CartPole-v1")
+    
+    @property
+    def action_space(self):
+        return self._env.action_space
+    
+    @property
+    def observation_space(self):
+        return self._env.observation_space
+        
+    def reset(self):
+        observation, info = self._env.reset()
+        return observation  # 直接状態ベクトルを返す
+        
+    def render(self):
+        self._env.render()
+        
+    def step(self, action):
+        n_state, reward, terminated, truncated, info = self._env.step(action)
+        done = terminated or truncated
+        return n_state, reward, done, info  # 直接状態ベクトルを返す
+
+
 class EvolutionalTrainer():
 
     def __init__(self, population_size=20, sigma=0.5, learning_rate=0.1,
@@ -130,13 +155,26 @@ class EvolutionalTrainer():
         agent.initialize(s)
         self.weights = agent.model.get_weights()
 
-        # 並列処理をシリアル処理に変更
+        # CPUコア数を取得してMac向けに最適化
+        import multiprocessing
+        n_jobs = min(multiprocessing.cpu_count() - 1, 8)  # Macの場合は適切な値を設定
+        if n_jobs <= 0:
+            n_jobs = 1
+        print(f"Using {n_jobs} CPU cores for parallel processing")
+        
+        # 各エポックで並列処理を実行
         for e in range(epoch):
-            results = []
-            for p in range(self.population_size):
-                result = EvolutionalTrainer.run_agent(
+            # 関数オブジェクト作成（各プロセスで実行する処理）
+            def experiment(p_index):
+                seed = np.random.randint(0, 2**32)
+                np.random.seed(seed)
+                return EvolutionalTrainer.run_agent(
                     episode_per_agent, self.weights, self.sigma)
-                results.append(result)
+            
+            # 並列処理の実行
+            parallel = Parallel(n_jobs=n_jobs, verbose=0, prefer="threads")
+            results = parallel(delayed(experiment)(i) for i in range(self.population_size))
+                
             self.update(results)
             self.log()
 
@@ -145,11 +183,12 @@ class EvolutionalTrainer():
 
     @classmethod
     def make_env(cls):
-        return CartPoleObserver(width=50, height=50, frame_count=1)
+        return CartPoleVectorObserver()
 
     @classmethod
     def run_agent(cls, episode_per_agent, base_weights, sigma, max_step=1000):
         try:
+            # 各実行で新しい環境を作成（並列処理でのリソース競合防止）
             env = cls.make_env()
             actions = list(range(env.action_space.n))
             agent = EvolutionalAgent(actions)
@@ -165,36 +204,42 @@ class EvolutionalTrainer():
 
             # Test Play
             total_reward = 0
+            episode_count = 0  # 成功したエピソードのカウント
             for e in range(episode_per_agent):
-                s = env.reset()
-                if s is None:
-                    return 0, noises
-                    
-                if agent.model is None:
-                    agent.initialize(s, new_weights)
-                
-                done = False
-                step = 0
-                
-                while not done and step < max_step:
-                    a = agent.policy(s)
-                    try:
-                        n_state, reward, done, info = env.step(a)
-                        if n_state is None:
-                            done = True
-                            continue
+                try:
+                    s = env.reset()
+                    if s is None:
+                        continue  # リセットに失敗した場合は次のエピソードへ
                         
-                        total_reward += reward
-                        s = n_state
-                    except Exception as e:
-                        print(f"Step execution error: {e}")
-                        done = True
-                    step += 1
+                    if agent.model is None:
+                        agent.initialize(s, new_weights)
+                    
+                    done = False
+                    step = 0
+                    episode_reward = 0
+                    
+                    while not done and step < max_step:
+                        a = agent.policy(s)
+                        try:
+                            n_state, reward, done, info = env.step(a)
+                            if n_state is None:
+                                break
+                            
+                            episode_reward += reward
+                            s = n_state
+                        except Exception as e:
+                            break
+                        step += 1
 
-            reward = total_reward / max(episode_per_agent, 1)
+                    total_reward += episode_reward
+                    episode_count += 1
+                except Exception:
+                    continue
+
+            # 少なくとも1つのエピソードが成功した場合のみ平均を計算
+            reward = total_reward / max(episode_count, 1)
             return reward, noises
         except Exception as e:
-            print(f"Agent execution error: {e}")
             return 0, [np.zeros_like(w) for w in base_weights]
 
     def update(self, agent_results):
@@ -277,8 +322,16 @@ def main(play):
         agent = EvolutionalAgent.load(env, model_path)
         agent.play(env, episode_count=5, render=True)
     else:
-        trainer = EvolutionalTrainer()
-        trained = trainer.train()
+        trainer = EvolutionalTrainer(
+            population_size=100,  # より多くの個体で探索
+            sigma=0.1,            # ノイズの大きさを調整
+            learning_rate=0.05,   # 学習率を調整
+            report_interval=5
+        )
+        trained = trainer.train(
+            epoch=200,            # より多くのエポックで学習
+            episode_per_agent=5   # 各エージェントをより多くのエピソードで評価
+        )
         trained.save(model_path)
         trainer.plot_rewards()
 

@@ -24,13 +24,18 @@
 環境: CartPole-v1 (デフォルト)
 """
 
-import os
+import os, sys
 import argparse
 import numpy as np
 from joblib import Parallel, delayed
 from PIL import Image
 import matplotlib.pyplot as plt
 import gymnasium as gym  # gymからgymnasiumに変更
+import platform
+
+# ファイル冒頭に追加
+os.environ["VECLIB_MAXIMUM_THREADS"] = "8"  # Apple Silicon用に最適化
+np.random.seed(0)  # 一貫性のある結果を得るために設定
 
 # Disable TensorFlow GPU for parallel execution
 if os.name == "nt":
@@ -42,12 +47,36 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 import tensorflow as tf
 import tensorflow.keras as K
 
-class EvolutionalAgent():
+# TensorFlow設定を最適化（ファイル冒頭に一度だけ実行）
+def configure_tensorflow():
+    # Apple Siliconの場合のみMPSを設定
+    if platform.processor() == 'arm':
+        # TensorFlow-Metal向け環境変数
+        os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+        
+        # TF設定
+        physical_devices = tf.config.list_physical_devices()
+        if any('GPU' in device.name for device in physical_devices):
+            print("MPS/GPU 加速が有効化されました")
+        else:
+            print("CPU モードで実行します")
 
+        # スレッド最適化
+        tf.config.threading.set_intra_op_parallelism_threads(8)
+        tf.config.threading.set_inter_op_parallelism_threads(1)
+    
+    # ログレベルを最も厳格に設定
+    os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
+# TensorFlow初期化（一度だけ実行）
+configure_tensorflow()
+
+class EvolutionalAgent():
     def __init__(self, actions):
         self.actions = actions
         self.model = None
-
+        self._predict_fn = None  # 推論関数をキャッシュ
+        
     def save(self, model_path):
         self.model.save(model_path, overwrite=True, include_optimizer=False)
 
@@ -59,9 +88,9 @@ class EvolutionalAgent():
         return agent
 
     def initialize(self, state, weights=()):
-        # シンプルなフィードフォワードネットワーク
+        # 以前と同じモデル構築
         normal = K.initializers.GlorotNormal()
-        inputs = K.Input(shape=(len(state),))  # 状態ベクトルの次元
+        inputs = K.Input(shape=(len(state),), dtype=tf.float32)
         x = K.layers.Dense(24, activation="relu", kernel_initializer=normal)(inputs)
         x = K.layers.Dense(24, activation="relu", kernel_initializer=normal)(x)
         outputs = K.layers.Dense(len(self.actions), activation="softmax")(x)
@@ -70,11 +99,33 @@ class EvolutionalAgent():
         
         if len(weights) > 0:
             self.model.set_weights(weights)
+            
+        # モデルをコンパイル
+        self.model.compile(optimizer='adam', loss='categorical_crossentropy')
+        
+        # JITコンパイルを使わない安全な関数定義
+        @tf.function(reduce_retracing=True)  # jit_compile=True を削除
+        def predict_fn(x):
+            return self.model(x, training=False)
+            
+        self._predict_fn = predict_fn
+        
+        # ウォームアップ推論（try-except で囲む）
+        try:
+            dummy_input = np.zeros((1, len(state)), dtype=np.float32)
+            self._predict_fn(tf.convert_to_tensor(dummy_input))
+        except Exception as e:
+            print(f"警告: GPU推論初期化エラー。CPU推論に切り替えます: {e}")
+            # エラー時はモデル直接呼び出しにフォールバック
+            self._predict_fn = lambda x: self.model.predict(x, verbose=0)
 
     def policy(self, state):
-        state_array = np.array([state])
-        # 最新のTensorFlowに対応
-        action_probs = self.model.predict(state_array, verbose=0)[0]
+        # 一貫した型とバッチサイズでテンソル化
+        state_tensor = tf.convert_to_tensor(
+            np.array([state], dtype=np.float32)
+        )
+        # キャッシュした関数で高速推論
+        action_probs = self._predict_fn(state_tensor)[0].numpy()
         action = np.random.choice(self.actions, size=1, p=action_probs)[0]
         return action
 
@@ -140,7 +191,8 @@ class CartPoleObserver():
 # CartPoleObserverの代わりにこちらを使用
 class CartPoleVectorObserver():
     def __init__(self):
-        self._env = gym.make("CartPole-v1")
+        # レンダリングなしでメモリ使用量を削減
+        self._env = gym.make("CartPole-v1", render_mode=None)
     
     @property
     def action_space(self):
@@ -173,7 +225,43 @@ class EvolutionalTrainer():
         self.weights = ()
         self.reward_log = []
 
+    @classmethod
+    def experiment(cls, p_index, weights, sigma, episode_per_agent):
+        """シリアライズ可能なクラスメソッドとして実験関数を定義"""
+        import time
+        import numpy as np
+        import os
+        
+        # 子プロセスではTensorFlowの警告を完全に無効化
+        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+        
+        # 乱数シードを設定して独立性を確保
+        seed = int(time.time() * 1000000) % (2**32) + p_index
+        np.random.seed(seed)
+        
+        # 余計な出力を全て抑制（標準出力のリダイレクト）
+        if p_index > 0:  # メインプロセス以外は出力を完全に抑制
+            sys.stdout = open(os.devnull, 'w')
+            sys.stderr = open(os.devnull, 'w')  # 標準エラー出力も抑制
+        
+        try:
+            result = cls.run_agent(episode_per_agent, weights, sigma)
+        finally:
+            # 出力を元に戻す
+            if p_index > 0:
+                sys.stdout.close()
+                sys.stdout = sys.__stdout__
+                sys.stderr.close()
+                sys.stderr = sys.__stderr__
+                
+        return result
+
     def train(self, epoch=100, episode_per_agent=1, render=False):
+        # GPU使用時は並列数を調整
+        is_using_gpu = any('GPU' in device.name for device in tf.config.list_physical_devices())
+        n_jobs = 4 if is_using_gpu else 7  # GPU使用時は並列数を減らす
+        print(f"{'GPU' if is_using_gpu else 'CPU'} モード: {n_jobs}並列で実行")
+
         env = self.make_env()
         actions = list(range(env.action_space.n))
         s = env.reset()
@@ -183,23 +271,24 @@ class EvolutionalTrainer():
 
         # CPUコア数を取得してMac向けに最適化
         import multiprocessing
-        n_jobs = min(multiprocessing.cpu_count() - 1, 8)  # Macの場合は適切な値を設定
-        if n_jobs <= 0:
-            n_jobs = 1
+        n_jobs = 7  # M3チップの8コア中7コアを使用
         print(f"Using {n_jobs} CPU cores for parallel processing")
         
         # 各エポックで並列処理を実行
         for e in range(epoch):
-            # 関数オブジェクト作成（各プロセスで実行する処理）
-            def experiment(p_index):
-                seed = np.random.randint(0, 2**32)
-                np.random.seed(seed)
-                return EvolutionalTrainer.run_agent(
-                    episode_per_agent, self.weights, self.sigma)
+            # M3向け最適化
+            parallel = Parallel(n_jobs=n_jobs, verbose=0, 
+                              prefer="processes", # スレッドより高速なプロセスを使用
+                              batch_size="auto", 
+                              backend="multiprocessing", # より高速なバックエンド
+                              max_nbytes=None) # メモリ制限を解除
             
-            # 並列処理の実行
-            parallel = Parallel(n_jobs=n_jobs, verbose=0, prefer="threads")
-            results = parallel(delayed(experiment)(i) for i in range(self.population_size))
+            # パラメータを使用してクラスメソッドを呼び出す
+            results = parallel(
+                delayed(self.__class__.experiment)(
+                    i, self.weights, self.sigma, episode_per_agent
+                ) for i in range(self.population_size)
+            )
                 
             self.update(results)
             self.log()
@@ -244,18 +333,27 @@ class EvolutionalTrainer():
                     step = 0
                     episode_reward = 0
                     
+                    # バッチサイズを増やしてステップ数を減らす
+                    BATCH_SIZE = 4  # 一度に複数のステップを評価
+                    
                     while not done and step < max_step:
-                        a = agent.policy(s)
-                        try:
-                            n_state, reward, done, info = env.step(a)
-                            if n_state is None:
+                        # 現在の状態を複製
+                        states = np.array([s] * BATCH_SIZE) if BATCH_SIZE > 1 else np.array([s])
+                        
+                        # バッチ予測
+                        actions = []
+                        for state in states:
+                            a = agent.policy(state)
+                            actions.append(a)
+                        
+                        # 順次実行（環境は並列化できない）
+                        for a in actions:
+                            if done:
                                 break
-                            
+                            n_state, reward, done, info = env.step(a)
                             episode_reward += reward
                             s = n_state
-                        except Exception as e:
-                            break
-                        step += 1
+                            step += 1
 
                     total_reward += episode_reward
                     episode_count += 1
@@ -340,7 +438,7 @@ class EvolutionalTrainer():
         plt.show()
 
 
-def main(play):
+def main(play, epochs, pop_size, sigma, lr):
     model_path = os.path.join(os.path.dirname(__file__), "ev_agent.h5")
 
     if play:
@@ -349,14 +447,14 @@ def main(play):
         agent.play(env, episode_count=5, render=True)
     else:
         trainer = EvolutionalTrainer(
-            population_size=100,  # より多くの個体で探索
-            sigma=0.1,            # ノイズの大きさを調整
-            learning_rate=0.05,   # 学習率を調整
+            population_size=pop_size,  # より多くの個体で探索
+            sigma=sigma,               # ノイズの大きさを調整
+            learning_rate=lr,          # 学習率を調整
             report_interval=5
         )
         trained = trainer.train(
-            epoch=200,            # より多くのエポックで学習
-            episode_per_agent=5   # 各エージェントをより多くのエピソードで評価
+            epoch=epochs,              # より多くのエポックで学習
+            episode_per_agent=5        # 各エージェントをより多くのエピソードで評価
         )
         trained.save(model_path)
         trainer.plot_rewards()
@@ -364,8 +462,18 @@ def main(play):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evolutional Agent")
-    parser.add_argument("--play", action="store_true",
-                        help="play with trained model")
+    parser.add_argument("--play", action="store_true", help="学習済みモデルで実行")
+    parser.add_argument("--epochs", type=int, default=100, help="学習エポック数")
+    parser.add_argument("--pop-size", type=int, default=100, help="集団サイズ")
+    parser.add_argument("--sigma", type=float, default=0.1, help="探索のノイズ幅")
+    parser.add_argument("--lr", type=float, default=0.05, help="学習率")
+    parser.add_argument("--silent", action="store_true", help="警告を抑制")
 
     args = parser.parse_args()
-    main(args.play)
+    
+    if args.silent:
+        import warnings
+        warnings.filterwarnings('ignore')
+        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+    
+    main(args.play, args.epochs, args.pop_size, args.sigma, args.lr)

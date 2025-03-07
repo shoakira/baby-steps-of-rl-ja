@@ -13,31 +13,33 @@
 # main.py - メインエントリポイント
 ###############################################################################
 
+# 標準ライブラリ
 import os
 import sys
+import time
 import argparse
 import datetime
+import warnings
+from typing import Optional, Tuple, Dict, Any
+
+# サードパーティライブラリ
+import numpy as np
 import gymnasium as gym
 import tensorflow as tf
-import numpy as np
-import warnings
+
+# 内部モジュール（早期インポートを避けるため関数内でインポート）
 
 
-def main(play, epochs, pop_size, sigma, lr, silent=False):
-    """メインエントリポイント関数（学習または実行）
+def setup_environment(silent: bool = False) -> Tuple[datetime.datetime, str]:
+    """環境セットアップと初期化を行う
     
     Args:
-        play (bool): Trueの場合は既存モデルでプレイ、Falseの場合は学習を実行
-        epochs (int): 学習エポック数
-        pop_size (int): 集団サイズ
-        sigma (float): ノイズ幅
-        lr (float): 学習率
-        silent (bool): 警告・情報メッセージを抑制するかどうか
+        silent: 出力を抑制するかどうか
+        
+    Returns:
+        開始時刻とモデルパス
     """
     from config import Config
-    from agent import EvolutionalAgent
-    from environment import CartPoleVectorObserver
-    from trainer import EvolutionalTrainer
     from utils import configure_tensorflow
     
     start_time = datetime.datetime.now()
@@ -55,62 +57,208 @@ def main(play, epochs, pop_size, sigma, lr, silent=False):
     # モデル保存パス設定
     model_path = Config.get_model_path()
     
-    if play:
+    return start_time, model_path
+
+
+def play_agent(model_path: str) -> None:
+    """学習済みエージェントで環境を実行
+    
+    Args:
+        model_path: 学習済みモデルのパス
+    """
+    from environment import CartPoleVectorObserver
+    from agent import EvolutionalAgent
+    
+    try:
         # "human"を指定して可視化環境を作成
         env = CartPoleVectorObserver(render_mode="human")
         agent = EvolutionalAgent.load(env, model_path)
         agent.play(env, episode_count=5, render=True)
-    else:
+    except Exception as e:
+        print(f"エラー: エージェントの実行に失敗しました: {e}")
+        sys.exit(1)
+
+
+def train_agent(
+    epochs: int, 
+    pop_size: int, 
+    sigma: float, 
+    lr: float, 
+    silent: bool = False
+) -> Dict[str, Any]:
+    """エージェントを学習し、結果を返す
+    
+    Args:
+        epochs: 学習エポック数
+        pop_size: 集団サイズ
+        sigma: ノイズ幅
+        lr: 学習率
+        silent: サイレントフラグ
+        
+    Returns:
+        学習結果の辞書（トレーナー、開始時刻など）
+    """
+    from config import Config
+    from agent import EvolutionalAgent
+    from trainer import EvolutionalTrainer
+    
+    start_time, model_path = setup_environment(silent)
+    
+    try:
         # トレーナー初期化
         trainer = EvolutionalTrainer(
-            population_size=pop_size,  # 集団サイズ
-            sigma=sigma,               # ノイズ幅
-            learning_rate=lr,          # 学習率
-            report_interval=5          # ログ間隔
+            population_size=pop_size,
+            sigma=sigma,
+            learning_rate=lr,
+            report_interval=5
         )
+        
         # 学習実行
         trained = trainer.train(
-            epoch=epochs,             # エポック数
-            episode_per_agent=Config.DEFAULT_EPISODE_PER_AGENT,  # 1個体あたりのエピソード数
-            silent=silent             # サイレントフラグ
+            epoch=epochs,
+            episode_per_agent=Config.DEFAULT_EPISODE_PER_AGENT,
+            silent=silent
         )
-        trained.save(model_path)      # モデル保存
         
-        # 結果表示
-        if not silent:
-            end_time = datetime.datetime.now()
-            elapsed = end_time - start_time
-            print(f"総実行時間: {elapsed.total_seconds():.1f}秒")
-            print(f"モデル保存先: {model_path}")
-            
-            # メモリ使用状況を表示（オプション）
-            try:
-                import psutil
-                process = psutil.Process()
-                memory_info = process.memory_info()
-                print(f"メモリ使用量: {memory_info.rss / (1024 * 1024):.1f} MB")
-            except ImportError:
-                # psutilがインストールされていない場合は表示しない
-                pass
+        # モデル保存
+        trained.save(model_path)
         
+        return {
+            "trainer": trainer,
+            "model_path": model_path,
+            "start_time": start_time,
+            "trained_agent": trained
+        }
+        
+    except KeyboardInterrupt:
+        print("\n学習が中断されました。これまでの結果を保存します...")
+        if 'trained' in locals():
+            trained.save(f"{model_path}.interrupted")
+            print(f"中断された学習結果を保存: {model_path}.interrupted")
+        return {}
+        
+    except Exception as e:
+        print(f"エラー: 学習中にエラーが発生しました: {e}")
+        import traceback
+        traceback.print_exc()
+        return {}
+
+
+def display_results(results: Dict[str, Any], silent: bool = False) -> None:
+    """学習結果を表示・保存する
+    
+    Args:
+        results: 学習結果の辞書
+        silent: サイレントフラグ
+    """
+    if not results or silent:
+        return
+        
+    trainer = results.get("trainer")
+    model_path = results.get("model_path")
+    start_time = results.get("start_time")
+    
+    if not all([trainer, model_path, start_time]):
+        return
+    
+    # 実行時間計算
+    end_time = datetime.datetime.now()
+    elapsed = end_time - start_time
+    print(f"総実行時間: {elapsed.total_seconds():.1f}秒")
+    print(f"モデル保存先: {model_path}")
+    
+    # メモリ使用状況を表示（オプション）
+    try:
+        import psutil
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        print(f"メモリ使用量: {memory_info.rss / (1024 * 1024):.1f} MB")
+    except ImportError:
+        # psutilがインストールされていない場合は表示しない
+        pass
+    
+    # 結果の保存と表示
+    try:
         # 結果データから適切なy軸最大値を判断
-        max_reward = max([rs.mean() for rs in trainer.reward_log])
-        y_max = None  # 自動設定をデフォルトに
-        
-        if max_reward < 100:
-            y_max = 120  # 低い報酬時は細かく表示
-        elif max_reward < 300:
-            y_max = 350  # 中程度の報酬時
+        reward_data = trainer.reward_log
+        if reward_data:
+            max_reward = max([rs.mean() for rs in reward_data])
+            y_max = None  # 自動設定をデフォルトに
             
-        # 結果の保存と表示
-        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        result_filename = f"es_results_e{epochs}_p{pop_size}_s{sigma}_lr{lr}_{timestamp}.png"
-        trainer.plot_rewards(result_filename, y_max=y_max)
+            if max_reward < 100:
+                y_max = 120  # 低い報酬時は細かく表示
+            elif max_reward < 300:
+                y_max = 350  # 中程度の報酬時
+            
+            # 一意のファイル名で結果を保存
+            timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            epochs = len(reward_data)
+            pop_size = trainer.population_size
+            sigma = trainer.sigma
+            lr = trainer.learning_rate
+            
+            result_filename = f"es_results_e{epochs}_p{pop_size}_s{sigma}_lr{lr}_{timestamp}.png"
+            trainer.plot_rewards(result_filename, y_max=y_max)
+    except Exception as e:
+        print(f"警告: 結果の表示中にエラーが発生しました: {e}")
+
+
+def main(play: bool, epochs: int, pop_size: int, sigma: float, lr: float, silent: bool = False) -> None:
+    """メインエントリポイント関数
+    
+    Args:
+        play: Trueの場合は既存モデルでプレイ、Falseの場合は学習を実行
+        epochs: 学習エポック数
+        pop_size: 集団サイズ
+        sigma: ノイズ幅
+        lr: 学習率
+        silent: サイレントフラグ
+    """
+    try:
+        # コードが属するパスをシステムパスに追加（インポート問題を回避）
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        if current_dir not in sys.path:
+            sys.path.append(current_dir)
+            
+        # 設定のロード（モジュールの相互依存を解決するため遅延インポート）
+        from config import Config
+
+        if play:
+            # プレイモード
+            _, model_path = setup_environment(silent)
+            play_agent(model_path)
+        else:
+            # 学習モード
+            results = train_agent(epochs, pop_size, sigma, lr, silent)
+            display_results(results, silent)
+            
+    except Exception as e:
+        print(f"致命的エラー: {e}")
+        import traceback
+        traceback.print_exc()
+        sys.exit(1)
 
 
 # スクリプト実行時のエントリーポイント
 if __name__ == "__main__":
-    from config import Config
+    # パスの設定
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    if current_dir not in sys.path:
+        sys.path.append(current_dir)
+    
+    # 設定モジュールのインポート
+    try:
+        from config import Config
+    except ImportError:
+        print("エラー: config モジュールが見つかりません。")
+        print("必要なファイル構成:")
+        print("- config.py: 設定と定数")
+        print("- agent.py: エージェントの実装")
+        print("- environment.py: 環境ラッパー")
+        print("- trainer.py: 進化戦略トレーナー")
+        print("- utils.py: ユーティリティ関数")
+        sys.exit(1)
+        
     # コマンドライン引数の設定
     parser = argparse.ArgumentParser(description="Evolution Strategy Agent")
     parser.add_argument("--play", action="store_true", help="学習済みモデルで実行")

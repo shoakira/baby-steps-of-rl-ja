@@ -57,7 +57,7 @@ def configure_tensorflow(silent=False):
         # TF設定
         physical_devices = tf.config.list_physical_devices()
         if any('GPU' in device.name for device in physical_devices) and not silent:
-            #print("MPS/GPU 加速が有効化されました")
+            print("ゲホッゲホMPS/GPU 加速が有効化されました")
         elif not silent:
             print("CPU モードで実行します")
 
@@ -68,8 +68,6 @@ def configure_tensorflow(silent=False):
     # ログレベルを最も厳格に設定
     os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
-# TensorFlow初期化（一度だけ実行）
-configure_tensorflow()
 
 class EvolutionalAgent():
     def __init__(self, actions):
@@ -489,7 +487,6 @@ if __name__ == "__main__":
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     
     # silentフラグに基づいてTensorFlow設定を構成
-    configure_tensorflow(silent=args.silent)
+    configure_tensorflow(silent=args.silent)  # この1回だけ呼び出す
     
-    # メインにsilentフラグを渡す
     main(args.play, args.epochs, args.pop_size, args.sigma, args.lr, args.silent)

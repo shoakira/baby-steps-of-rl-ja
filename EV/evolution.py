@@ -492,8 +492,13 @@ class EvolutionalTrainer():
             len(self.reward_log), rewards.mean(),
             rewards.max(), rewards.min()))
 
-    def plot_rewards(self, save_path=None):
-        """学習曲線のプロット（ファイル保存機能追加）"""
+    def plot_rewards(self, save_path=None, y_max=None):
+        """学習曲線のプロット（ファイル保存機能追加、縦軸範囲指定可能）
+        
+        Args:
+            save_path: 保存ファイル名（省略時は自動生成）
+            y_max: 縦軸の最大値（省略時はデータに基づき自動設定）
+        """
         # プロットデータ準備
         indices = range(len(self.reward_log))
         means = np.array([rs.mean() for rs in self.reward_log])
@@ -515,8 +520,22 @@ class EvolutionalTrainer():
         plt.ylabel("Average Reward")
         plt.legend(loc="best")
         
+        # 縦軸の範囲設定
+        max_reward = means.max() + stds.max()  # データの最大値+標準偏差
+        
+        if y_max is None:
+            # 自動設定: データの最大値+余白、または500のうち大きい方
+            if max_reward < 450:  # データが十分小さければ自動調整
+                plt.ylim(0, max_reward * 1.1)  # 10%のマージン
+            else:
+                plt.ylim(0, 550)  # CartPoleの最大値+マージン
+        else:
+            # 指定値を使用
+            plt.ylim(0, y_max)
+        
         # 500報酬の線を追加（CartPoleのゴール）
-        plt.axhline(y=500, color='r', linestyle='--', alpha=0.3, label="Solved")
+        if max_reward > 100 or y_max is None or y_max >= 500:  # 報酬が十分大きい場合のみ表示
+            plt.axhline(y=500, color='r', linestyle='--', alpha=0.3, label="Solved")
         
         # plotfileフォルダの作成と保存処理
         base_dir = os.path.dirname(os.path.abspath(__file__))
@@ -587,12 +606,20 @@ def main(play, epochs, pop_size, sigma, lr, silent=False):
             elapsed = end_time - start_time
             print(f"総実行時間: {elapsed.total_seconds():.1f}秒")
             print(f"モデル保存先: {model_path}")
+        
+        # 結果データから適切なy軸最大値を判断
+        max_reward = max([rs.mean() for rs in trainer.reward_log])
+        y_max = None  # 自動設定をデフォルトに
+        
+        if max_reward < 100:
+            y_max = 120  # 低い報酬時は細かく表示
+        elif max_reward < 300:
+            y_max = 350  # 中程度の報酬時
             
-        # 結果の保存と表示（plotfileフォルダに保存）
+        # 結果の保存と表示
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         result_filename = f"es_results_e{epochs}_p{pop_size}_s{sigma}_lr{lr}_{timestamp}.png"
-        # パスを直接指定せず、plot_rewards内でフォルダを処理する
-        trainer.plot_rewards(result_filename)
+        trainer.plot_rewards(result_filename, y_max=y_max)
 
 
 # ===== スクリプト実行時のエントリーポイント =====

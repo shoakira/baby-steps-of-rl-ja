@@ -37,6 +37,7 @@ python evolution.py [オプション]
 import os, sys
 import argparse  # コマンドライン引数処理
 import numpy as np  # 数値計算
+import datetime  # 時刻と日付の処理
 from joblib import Parallel, delayed  # 並列処理
 from PIL import Image  # 画像処理
 import matplotlib.pyplot as plt  # グラフ描画
@@ -466,19 +467,56 @@ class EvolutionalTrainer():
             len(self.reward_log), rewards.mean(),
             rewards.max(), rewards.min()))
 
-    def plot_rewards(self):
-        """学習曲線のプロット"""
+    def plot_rewards(self, save_path=None):
+        """学習曲線のプロット（ファイル保存機能追加）"""
+        # プロットデータ準備
         indices = range(len(self.reward_log))
         means = np.array([rs.mean() for rs in self.reward_log])
         stds = np.array([rs.std() for rs in self.reward_log])
-        plt.figure()
-        plt.title("Reward History")
+        
+        # グラフサイズ設定
+        plt.figure(figsize=(10, 6))
+        plt.title(f"Evolution Strategy Learning Curve (pop={self.population_size}, σ={self.sigma}, lr={self.learning_rate})")
         plt.grid()
+        
+        # データプロット
         plt.fill_between(indices, means - stds, means + stds,
                          alpha=0.1, color="g")  # 標準偏差範囲
         plt.plot(indices, means, "o-", color="g",
-                 label="reward")  # 平均報酬
+                 label=f"Reward (final: {means[-1]:.1f})")  # 平均報酬
+        
+        # ラベル設定
+        plt.xlabel("Epochs")
+        plt.ylabel("Average Reward")
         plt.legend(loc="best")
+        
+        # 500報酬の線を追加（CartPoleのゴール）
+        plt.axhline(y=500, color='r', linestyle='--', alpha=0.3, label="Solved")
+        
+        # plotfileフォルダの作成と保存処理
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        plot_dir = os.path.join(base_dir, "plotfile")
+        
+        # フォルダが存在しなければ作成
+        if not os.path.exists(plot_dir):
+            os.makedirs(plot_dir)
+        
+        # 保存パス設定
+        if save_path:
+            # 指定されたファイル名をplotfileフォルダ内に配置
+            filename = os.path.basename(save_path)
+            final_path = os.path.join(plot_dir, filename)
+        else:
+            # 自動ファイル名生成
+            timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            filename = f"es_results_{timestamp}.png"
+            final_path = os.path.join(plot_dir, filename)
+        
+        # ファイル保存
+        plt.savefig(final_path, dpi=100, bbox_inches='tight')
+        print(f"学習曲線を保存しました: {final_path}")
+        
+        # 画面表示も行う
         plt.show()
 
 
@@ -513,7 +551,12 @@ def main(play, epochs, pop_size, sigma, lr, silent=False):
             silent=silent             # サイレントフラグ
         )
         trained.save(model_path)      # モデル保存
-        trainer.plot_rewards()        # 結果の可視化
+        
+        # 結果の保存と表示（plotfileフォルダに保存）
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        result_filename = f"es_results_e{epochs}_p{pop_size}_s{sigma}_lr{lr}_{timestamp}.png"
+        # パスを直接指定せず、plot_rewards内でフォルダを処理する
+        trainer.plot_rewards(result_filename)
 
 
 # ===== スクリプト実行時のエントリーポイント =====

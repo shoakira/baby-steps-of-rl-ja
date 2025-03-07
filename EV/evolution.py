@@ -270,41 +270,39 @@ class EvolutionalTrainer():
         import numpy as np
         import os
         
-        # 並列処理のデータ転送を最適化（新規追加）
+        # デバッグ情報保存用
+        debug_info = []
+        start_time = time.time()
+        
+        # 並列処理のデータ転送を最適化
         import pickle
         pickle.HIGHEST_PROTOCOL = 4  # シリアライズを高速化
-        
-        # メインプロセスのみ進捗を表示（joblib内部で処理されるため通常は表示されない）
-        if p_index == 0:
-            print(f"\r    個体評価: 0/{episode_per_agent}エピソード", end="")
-        
-        # TensorFlow警告抑制
-        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
         
         # プロセスごとに独立した乱数シード設定
         seed = int(time.time() * 1000000) % (2**32) + p_index
         np.random.seed(seed)
         
-        # 並列プロセスの出力リダイレクト（ログ混在防止）
-        old_stdout = sys.stdout
-        old_stderr = sys.stderr
-        
-        # 全プロセスの出力を抑制
-        if p_index >= 0:
-            sys.stdout = open(os.devnull, 'w')
-            sys.stderr = open(os.devnull, 'w')
+        # メインプロセスのみ進捗を表示
+        if p_index == 0:
+            sys.stdout.write(f"\r    個体評価: 準備中...")
+            sys.stdout.flush()
         
         try:
             # エージェント実行で報酬とノイズを取得
-            result = cls.run_agent(episode_per_agent, weights, sigma)
-        finally:
-            # メインプロセスの出力を元に戻す
-            if p_index == 0:  # インデックス0のみ
-                sys.stdout.close()
-                sys.stdout = old_stdout
-                sys.stderr.close()
-                sys.stderr = old_stderr
+            result, debug = cls.run_agent(episode_per_agent, weights, sigma, p_index=p_index)
             
+            # メインプロセスの場合、デバッグ情報を表示
+            if p_index == 0:
+                elapsed = time.time() - start_time
+                sys.stdout.write(f"\r    個体評価完了: {elapsed:.1f}秒 [{debug}]")
+                sys.stdout.flush()
+                
+        except Exception as e:
+            if p_index == 0:
+                sys.stdout.write(f"\r    個体評価エラー: {str(e)}")
+                sys.stdout.flush()
+            result = (0, [np.zeros_like(w) for w in weights])
+                
         return result
 
     def train(self, epoch=100, episode_per_agent=1, render=False, silent=False):
@@ -344,19 +342,27 @@ class EvolutionalTrainer():
             print(f"[4/5] 学習開始: {epoch}エポック x {self.population_size}個体")
         
         for e in range(epoch):
+            # 並列個体評価
             if not silent:
-                print(f"\r  エポック {e+1}/{epoch}: 評価中...", end="")
+                print(f"\r  エポック {e+1}/{epoch}: 評価開始 ({datetime.datetime.now().strftime('%H:%M:%S')})...", end="")
                 sys.stdout.flush()
                 
-            # 並列個体評価
+            start_eval = time.time()
             results = parallel(
                 delayed(self.__class__.experiment)(
                     i, self.weights, self.sigma, episode_per_agent
                 ) for i in range(self.population_size)
             )
+            eval_time = time.time() - start_eval
             
-            # 結果を使って重みを更新
+            # 重み更新
+            if not silent:
+                print(f"\r  エポック {e+1}/{epoch}: 更新中 (評価時間: {eval_time:.1f}秒)...", end="")
+                sys.stdout.flush()
+                
+            update_start = time.time()
             self.update(results)
+            update_time = time.time() - update_start
             
             if not silent:
                 rewards = self.reward_log[-1]
@@ -375,26 +381,47 @@ class EvolutionalTrainer():
         return CartPoleVectorObserver()
 
     @classmethod
-    def run_agent(cls, episode_per_agent, base_weights, sigma, max_step=1000):
+    def run_agent(cls, episode_per_agent, base_weights, sigma, max_step=1000, p_index=-1):
         """エージェント実行による評価（個体の適合度計算）"""
+        import time
+        
+        debug_info = []  # デバッグ情報
+        start_time = time.time()
+        
         try:
-            # 各実行で新しい環境作成（並列処理でのリソース競合防止）
+            # 各実行で新しい環境作成
+            env_start = time.time()
             env = cls.make_env()
             actions = list(range(env.action_space.n))
+            debug_info.append(f"環境構築:{(time.time()-env_start):.1f}秒")
+            
+            # エージェント作成
+            agent_start = time.time()
             agent = EvolutionalAgent(actions)
+            debug_info.append(f"エージェント:{(time.time()-agent_start):.1f}秒")
 
             # ノイズ付き重みベクトル生成
+            noise_start = time.time()
             noises = []  # 適用したノイズを記録
             new_weights = []  # ノイズ適用済み重み
             for w in base_weights:
                 noise = np.random.randn(*w.shape)  # ガウス分布ノイズ
                 new_weights.append(w + sigma * noise)  # ノイズ適用
                 noises.append(noise)  # ノイズ記録（勾配計算用）
+            debug_info.append(f"ノイズ生成:{(time.time()-noise_start):.1f}秒")
 
             # エージェント評価
             total_reward = 0
             episode_count = 0  # 完了エピソード数
+            
             for e in range(episode_per_agent):
+                # メインプロセス (p_index=0) の場合のみ進捗表示
+                if p_index == 0:
+                    sys.stdout.write(f"\r    個体評価: {e}/{episode_per_agent}エピソード " + 
+                                   f"[{','.join(debug_info)}]")
+                    sys.stdout.flush()
+                    
+                # 以下、エピソード評価処理...
                 try:
                     s = env.reset()
                     if s is None:

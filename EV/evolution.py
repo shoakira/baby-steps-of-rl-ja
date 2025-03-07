@@ -313,7 +313,7 @@ class EvolutionalTrainer():
         
         # エポックごとの学習ループ
         for e in range(epoch):
-            # 並列個体評価（毎回新しい並列処理を作らない）
+            # 並列個体評価
             results = parallel(
                 delayed(self.__class__.experiment)(
                     i, self.weights, self.sigma, episode_per_agent
@@ -323,6 +323,10 @@ class EvolutionalTrainer():
             # 結果を使って重みを更新
             self.update(results)
             self.log()
+
+        # ここに追加: 訓練済みエージェントを返す
+        agent.model.set_weights(self.weights)
+        return agent
 
     @classmethod
     def make_env(cls):

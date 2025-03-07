@@ -52,7 +52,7 @@ class EvolutionalTrainer:
         
         # メインプロセス（index=0）のみ簡潔な進捗表示
         if p_index == 0:
-            sys.stdout.write(f"\r      個体{p_index}: エピソード評価中...\n")  # 改行を追加してバッファフラッシュを促進
+            sys.stdout.write(f"\r      個体{p_index}: エピソード評価中...")
             sys.stdout.flush()
         
         # タイムアウト機構
@@ -61,12 +61,12 @@ class EvolutionalTrainer:
             
         def timeout_handler():
             if p_index == 0:
-                sys.stdout.write(f"\r      個体{p_index}: タイムアウトしました。スキップします。\n")
+                sys.stdout.write(f"\r      個体{p_index}: タイムアウトしました。スキップします...")
                 sys.stdout.flush()
             raise TimeoutError("個体評価がタイムアウトしました")
         
         # タイムアウトタイマーをセット（30秒）
-        timer = threading.Timer(30.0, timeout_handler)
+        timer = threading.Timer(90.0, timeout_handler)
         
         try:
             # タイマー開始
@@ -80,7 +80,7 @@ class EvolutionalTrainer:
             
             # メインプロセスの場合、デバッグ情報を表示
             if p_index == 0 and debug_info:
-                sys.stdout.write(f"\r      評価完了: {debug_info[:60]}...\n")  # 改行を追加
+                sys.stdout.write(f"\r      評価完了: {debug_info[:60]}...")
                 sys.stdout.flush()
                 
             return result
@@ -95,7 +95,7 @@ class EvolutionalTrainer:
             
             # エラー時はゼロ報酬を返す
             if p_index == 0:
-                sys.stdout.write(f"\r      エラー: {str(e)[:30]}...\n")  # 改行を追加
+                sys.stdout.write(f"\r      エラー: {str(e)[:30]}...")
                 sys.stdout.flush()
             return (0, [np.zeros_like(w) for w in weights])
         
@@ -146,10 +146,11 @@ class EvolutionalTrainer:
         # 並列処理設定（一度だけ初期化して再利用）
         if not silent:
             print("[3/5] 並列評価エンジン準備中...")
-        parallel = Parallel(n_jobs=n_jobs, verbose=0, 
+        parallel = Parallel(n_jobs=min(n_jobs, 4), 
+                          verbose=0,
                           prefer="processes",
                           batch_size=1,  # バッチサイズを1に設定して、処理の詰まりを防止
-                          timeout=45,    # 45秒のグローバルタイムアウトを設定
+                          timeout=120,    # 45秒のグローバルタイムアウトを設定
                           backend="multiprocessing",
                           max_nbytes=None)
         
@@ -163,7 +164,7 @@ class EvolutionalTrainer:
             # 並列個体評価
             if not silent:
                 elapsed = time.time() - train_start
-                print(f"\r  エポック {e+1}/{epoch}: [タスク 1/2] 個体評価中... (経過時間: {elapsed:.1f}秒)")  # 改行を追加
+                print(f"\r  エポック {e+1}/{epoch}: [タスク 1/2] 個体評価中... (経過時間: {elapsed:.1f}秒)", end="")
                 sys.stdout.flush()
             
             # バッチサイズを小さくして並列処理の負荷分散を改善
@@ -176,7 +177,7 @@ class EvolutionalTrainer:
             # 重み更新
             if not silent:
                 elapsed = time.time() - train_start
-                print(f"\r  エポック {e+1}/{epoch}: [タスク 2/2] 重み更新中... (経過時間: {elapsed:.1f}秒)")  # 改行を追加
+                print(f"\r  エポック {e+1}/{epoch}: [タスク 2/2] 重み更新中... (経過時間: {elapsed:.1f}秒)", end="")
                 sys.stdout.flush()
                     
             self.update(results)
@@ -297,10 +298,6 @@ class EvolutionalTrainer:
                             sys.stdout.write(f"\r    [4/4] エピソード評価: {e+1}/{episode_per_agent} " + 
                                            f"(完了:{episode_count}, 実行中:ステップ{step}, 報酬:{episode_reward:.1f})")
                             sys.stdout.flush()
-                            
-                            # 進捗状況をより明確に示すため、50ステップごとに改行を入れる
-                            if step % 50 == 0 and step > 0:
-                                print(f"\n        ... ステップ{step}実行中 (報酬:{episode_reward:.1f}) ...")
                         
                         # 行動選択と環境ステップ
                         a = agent.policy(s)

@@ -105,3 +105,6 @@ FN/logs
 *.h5
 *.pkl
 /src
+
+# プロット画像フォルダ
+EV/plotfile/

@@ -99,6 +99,22 @@ class EvolutionalAgent():
         actions = list(range(env.action_space.n))
         agent = cls(actions)
         agent.model = K.models.load_model(model_path)
+        
+        # 高速推論関数の設定（読み込み時に初期化）
+        @tf.function(reduce_retracing=True)
+        def predict_fn(x):
+            return agent.model(x, training=False)
+        
+        agent._predict_fn = predict_fn
+        
+        # ウォームアップ推論
+        dummy_input = np.zeros((1, env.observation_space.shape[0]), dtype=np.float32)
+        try:
+            agent._predict_fn(tf.convert_to_tensor(dummy_input))
+        except Exception as e:
+            print(f"警告: GPU推論初期化エラー。CPU推論に切り替えます: {e}")
+            agent._predict_fn = lambda x: agent.model.predict(x, verbose=0)
+        
         return agent
 
     def initialize(self, state, weights=()):
@@ -148,7 +164,7 @@ class EvolutionalAgent():
     def play(self, env, episode_count=5, render=True):
         """学習済みエージェントで環境を実行"""
         for e in range(episode_count):
-            s, _ = env.reset()  # 環境リセット
+            s = env.reset()  # 環境リセット
             done = False
             terminated = False
             truncated = False
@@ -159,8 +175,7 @@ class EvolutionalAgent():
                 if render:
                     env.render()  # 可視化
                 a = self.policy(s)  # 行動選択
-                n_state, reward, terminated, truncated, info = env.step(a)
-                done = terminated or truncated
+                n_state, reward, done, info = env.step(a)  # ここは4つの値を返す
                 episode_reward += reward
                 s = n_state
             
@@ -581,7 +596,9 @@ def main(play, epochs, pop_size, sigma, lr, silent=False):
     model_path = os.path.join(os.path.dirname(__file__), "ev_agent.keras")
     
     if play:
-        env = EvolutionalTrainer.make_env()
+        # render_mode="human"を指定して可視化環境を作成
+        env = gym.make("CartPole-v1", render_mode="human")
+        env = CartPoleVectorObserver()  
         agent = EvolutionalAgent.load(env, model_path)
         agent.play(env, episode_count=5, render=True)
     else:

@@ -76,10 +76,19 @@ class EvolutionalAgent():
         self._predict_fn = None  # 推論関数をキャッシュ
         
     def save(self, model_path):
-        self.model.save(model_path, overwrite=True, include_optimizer=False)
+        # 拡張子をチェックして自動修正
+        if model_path.endswith('.h5'):
+            model_path = model_path.replace('.h5', '.keras')
+        self.model.save(model_path, overwrite=True, save_format='keras')
 
     @classmethod
     def load(cls, env, model_path):
+        # 拡張子をチェックして自動修正
+        if model_path.endswith('.h5') and not os.path.exists(model_path):
+            keras_path = model_path.replace('.h5', '.keras')
+            if os.path.exists(keras_path):
+                model_path = keras_path
+        
         actions = list(range(env.action_space.n))
         agent = cls(actions)
         agent.model = K.models.load_model(model_path)
@@ -448,7 +457,8 @@ def main(play, epochs, pop_size, sigma, lr, silent=False):
         import warnings
         warnings.filterwarnings('ignore')
 
-    model_path = os.path.join(os.path.dirname(__file__), "ev_agent.h5")
+    # .h5から.kerasに変更
+    model_path = os.path.join(os.path.dirname(__file__), "ev_agent.keras")
     # 以下略...
     if play:
         env = EvolutionalTrainer.make_env()

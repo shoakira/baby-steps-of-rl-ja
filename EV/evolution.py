@@ -34,7 +34,7 @@ python evolution.py [オプション]
 """
 
 # ===== ライブラリのインポート =====
-import os, sys
+import os, sys, time
 import argparse  # コマンドライン引数処理
 import numpy as np  # 数値計算
 import datetime  # 時刻と日付の処理
@@ -266,47 +266,31 @@ class EvolutionalTrainer():
     @classmethod
     def experiment(cls, p_index, weights, sigma, episode_per_agent):
         """個体評価実験（並列処理用、シリアライズ可能なクラスメソッド）"""
-        import time
-        import numpy as np
-        import os
-        
-        # デバッグ情報保存用
-        debug_info = []
-        start_time = time.time()
-        
-        # 並列処理のデータ転送を最適化
-        import pickle
-        pickle.HIGHEST_PROTOCOL = 4  # シリアライズを高速化
-        
         # プロセスごとに独立した乱数シード設定
         seed = int(time.time() * 1000000) % (2**32) + p_index
         np.random.seed(seed)
         
-        # メインプロセスのみ進捗を表示
+        # メインプロセス（index=0）のみ簡潔な進捗表示
         if p_index == 0:
-            sys.stdout.write(f"\r    個体評価: 準備中...")
+            sys.stdout.write(f"\r      個体0: エピソード評価中...")
             sys.stdout.flush()
         
         try:
             # エージェント実行で報酬とノイズを取得
-            result, debug = cls.run_agent(episode_per_agent, weights, sigma, p_index=p_index)
-            
-            # メインプロセスの場合、デバッグ情報を表示
-            if p_index == 0:
-                elapsed = time.time() - start_time
-                sys.stdout.write(f"\r    個体評価完了: {elapsed:.1f}秒 [{debug}]")
-                sys.stdout.flush()
-                
+            result = cls.run_agent(episode_per_agent, weights, sigma)
+            return result
+                    
         except Exception as e:
+            # エラー時はゼロ報酬を返す
             if p_index == 0:
-                sys.stdout.write(f"\r    個体評価エラー: {str(e)}")
+                sys.stdout.write(f"\r      エラー: {str(e)[:30]}...")
                 sys.stdout.flush()
-            result = (0, [np.zeros_like(w) for w in weights])
-                
-        return result
+            return (0, [np.zeros_like(w) for w in weights])
 
     def train(self, epoch=100, episode_per_agent=1, render=False, silent=False):
         """進化戦略によるエージェント訓練（メイン処理）"""
+        train_start = time.time()
+        
         if not silent:
             print("===== 進化戦略学習を開始します =====")
             print(f"エポック数: {epoch}, 集団サイズ: {self.population_size}")
@@ -342,32 +326,35 @@ class EvolutionalTrainer():
             print(f"[4/5] 学習開始: {epoch}エポック x {self.population_size}個体")
         
         for e in range(epoch):
+            epoch_start = time.time()
+            
             # 並列個体評価
             if not silent:
-                print(f"\r  エポック {e+1}/{epoch}: 評価開始 ({datetime.datetime.now().strftime('%H:%M:%S')})...", end="")
+                elapsed = time.time() - train_start
+                print(f"\r  エポック {e+1}/{epoch}: [タスク 1/2] 個体評価中... (経過時間: {elapsed:.1f}秒)", end="")
                 sys.stdout.flush()
-                
-            start_eval = time.time()
+                    
             results = parallel(
                 delayed(self.__class__.experiment)(
                     i, self.weights, self.sigma, episode_per_agent
                 ) for i in range(self.population_size)
             )
-            eval_time = time.time() - start_eval
             
             # 重み更新
             if not silent:
-                print(f"\r  エポック {e+1}/{epoch}: 更新中 (評価時間: {eval_time:.1f}秒)...", end="")
+                elapsed = time.time() - train_start
+                print(f"\r  エポック {e+1}/{epoch}: [タスク 2/2] 重み更新中... (経過時間: {elapsed:.1f}秒)", end="")
                 sys.stdout.flush()
-                
-            update_start = time.time()
+                    
             self.update(results)
-            update_time = time.time() - update_start
             
+            # エポック結果表示（これは残す）
             if not silent:
                 rewards = self.reward_log[-1]
+                epoch_time = time.time() - epoch_start
                 print(f"\r  エポック {e+1}/{epoch}: 報酬 {rewards.mean():.1f} (最大:{rewards.max():.1f})")
 
+        # 学習完了
         if not silent:
             print("[5/5] 学習完了、モデル最終化中...")
             
@@ -386,19 +373,31 @@ class EvolutionalTrainer():
         import time
         
         debug_info = []  # デバッグ情報
+        detailed_logs = []  # 詳細ログ
         start_time = time.time()
         
         try:
-            # 各実行で新しい環境作成
+            # 各実行で新しい環境作成（並列処理でのリソース競合防止）
             env_start = time.time()
             env = cls.make_env()
             actions = list(range(env.action_space.n))
-            debug_info.append(f"環境構築:{(time.time()-env_start):.1f}秒")
+            env_time = time.time() - env_start
+            debug_info.append(f"環境:{env_time:.1f}秒")
             
+            # デバッグ表示（メインプロセスのみ）
+            if p_index == 0:
+                sys.stdout.write(f"\r    [1/4] 環境構築: {env_time:.1f}秒")
+                sys.stdout.flush()
+
             # エージェント作成
             agent_start = time.time()
             agent = EvolutionalAgent(actions)
-            debug_info.append(f"エージェント:{(time.time()-agent_start):.1f}秒")
+            agent_time = time.time() - agent_start
+            debug_info.append(f"エージェント:{agent_time:.1f}秒")
+            
+            if p_index == 0:
+                sys.stdout.write(f"\r    [2/4] エージェント初期化: {agent_time:.1f}秒")
+                sys.stdout.flush()
 
             # ノイズ付き重みベクトル生成
             noise_start = time.time()
@@ -408,21 +407,27 @@ class EvolutionalTrainer():
                 noise = np.random.randn(*w.shape)  # ガウス分布ノイズ
                 new_weights.append(w + sigma * noise)  # ノイズ適用
                 noises.append(noise)  # ノイズ記録（勾配計算用）
-            debug_info.append(f"ノイズ生成:{(time.time()-noise_start):.1f}秒")
+            noise_time = time.time() - noise_start
+            debug_info.append(f"ノイズ:{noise_time:.1f}秒")
+            
+            if p_index == 0:
+                sys.stdout.write(f"\r    [3/4] ノイズ生成: {noise_time:.1f}秒")
+                sys.stdout.flush()
 
             # エージェント評価
             total_reward = 0
             episode_count = 0  # 完了エピソード数
+            eval_start = time.time()
             
             for e in range(episode_per_agent):
-                # メインプロセス (p_index=0) の場合のみ進捗表示
-                if p_index == 0:
-                    sys.stdout.write(f"\r    個体評価: {e}/{episode_per_agent}エピソード " + 
-                                   f"[{','.join(debug_info)}]")
-                    sys.stdout.flush()
-                    
-                # 以下、エピソード評価処理...
                 try:
+                    # メインプロセス (p_index=0) の場合のみ進捗表示
+                    if p_index == 0:
+                        sys.stdout.write(f"\r    [4/4] エピソード評価: {e+1}/{episode_per_agent} " + 
+                                       f"(完了:{episode_count})")
+                        sys.stdout.flush()
+                        
+                    episode_start = time.time()
                     s = env.reset()
                     if s is None:
                         continue  # リセット失敗時はスキップ
@@ -435,43 +440,46 @@ class EvolutionalTrainer():
                     step = 0
                     episode_reward = 0
                     
-                    # バッチ処理のサイズを動的に調整（環境に応じて）
-                    import psutil
-                    avail_mem = psutil.virtual_memory().available / (1024 * 1024 * 1024)  # GB
-                    BATCH_SIZE = 8 if avail_mem > 4 else 4  # 利用可能メモリに基づく調整
-                    
                     # エピソード実行
                     while not done and step < max_step:
-                        # 状態のバッチ化（同じ状態を複製）
-                        states = np.array([s] * BATCH_SIZE) if BATCH_SIZE > 1 else np.array([s])
+                        # 10ステップごとに進捗更新（メインプロセスのみ）
+                        if p_index == 0 and step % 10 == 0:
+                            sys.stdout.write(f"\r    [4/4] エピソード評価: {e+1}/{episode_per_agent} " + 
+                                           f"(完了:{episode_count}, 実行中:ステップ{step}, 報酬:{episode_reward:.1f})")
+                            sys.stdout.flush()
                         
-                        # バッチ予測で行動を事前計算
-                        actions = []
-                        for state in states:
-                            a = agent.policy(state)
-                            actions.append(a)
-                        
-                        # 環境ステップ実行（環境は並列化できないので順次処理）
-                        for a in actions:
-                            if done:
-                                break
-                            n_state, reward, done, info = env.step(a)
-                            episode_reward += reward
-                            s = n_state
-                            step += 1
+                        # 行動選択と環境ステップ
+                        a = agent.policy(s)
+                        n_state, reward, done, info = env.step(a)
+                        episode_reward += reward
+                        s = n_state
+                        step += 1
 
                     # エピソード完了
+                    episode_time = time.time() - episode_start
+                    detailed_logs.append(f"エピソード{e+1}: {step}ステップ, 報酬{episode_reward:.1f} ({episode_time:.1f}秒)")
                     total_reward += episode_reward
                     episode_count += 1
-                except Exception:
+                    
+                except Exception as e:
+                    detailed_logs.append(f"エピソード{e+1}エラー: {str(e)}")
                     continue  # エラー時は次のエピソードへ
 
+            # 評価終了
+            eval_time = time.time() - eval_start
+            debug_info.append(f"評価:{eval_time:.1f}秒")
+            
+            # 詳細ログをまとめる
+            debug_summary = ", ".join(debug_info)
+            detail = " | ".join(detailed_logs)
+            
             # 平均報酬計算（完了エピソードのみ）
             reward = total_reward / max(episode_count, 1)
-            return reward, noises  # 報酬とノイズを返す
+            return (reward, noises), f"{debug_summary} | {detail}"  # 報酬とノイズとデバッグ情報を返す
+            
         except Exception as e:
             # 全体エラー時はゼロ報酬を返す
-            return 0, [np.zeros_like(w) for w in base_weights]
+            return (0, [np.zeros_like(w) for w in base_weights]), f"エラー: {str(e)}"
 
     def update(self, agent_results):
         """収集した結果から重みを更新（進化戦略の核心部分）"""

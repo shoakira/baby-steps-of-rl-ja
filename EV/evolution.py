@@ -277,8 +277,15 @@ class EvolutionalTrainer():
         
         try:
             # エージェント実行で報酬とノイズを取得
-            result = cls.run_agent(episode_per_agent, weights, sigma)
-            return result
+            result, debug_info = cls.run_agent(episode_per_agent, weights, sigma)
+            
+            # メインプロセスの場合、デバッグ情報を表示
+            if p_index == 0 and debug_info:
+                sys.stdout.write(f"\r      評価完了: {debug_info[:60]}...")
+                sys.stdout.flush()
+                
+            # 重要: 第1要素のみを返す（(reward, noises)のタプル）
+            return result  # ここを修正
                     
         except Exception as e:
             # エラー時はゼロ報酬を返す

@@ -259,6 +259,10 @@ class EvolutionalTrainer():
         import pickle
         pickle.HIGHEST_PROTOCOL = 4  # シリアライズを高速化
         
+        # メインプロセスのみ進捗を表示（joblib内部で処理されるため通常は表示されない）
+        if p_index == 0:
+            print(f"\r    個体評価: 0/{episode_per_agent}エピソード", end="")
+        
         # TensorFlow警告抑制
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
         
@@ -290,14 +294,20 @@ class EvolutionalTrainer():
 
     def train(self, epoch=100, episode_per_agent=1, render=False, silent=False):
         """進化戦略によるエージェント訓練（メイン処理）"""
+        if not silent:
+            print("===== 進化戦略学習を開始します =====")
+            print(f"エポック数: {epoch}, 集団サイズ: {self.population_size}")
+            
         # GPU/CPU検出と並列数決定
         is_using_gpu = any('GPU' in device.name for device in tf.config.list_physical_devices())
         n_jobs = 4 if is_using_gpu else 7
         
         if not silent:
-            print(f"{'GPU計算 + ' if is_using_gpu else ''}CPU並列処理: {n_jobs}個のプロセスで評価")
+            print(f"[1/5] 環境準備: {'GPU計算 + ' if is_using_gpu else ''}CPU並列処理: {n_jobs}個のプロセス")
 
         # 環境と基本エージェントの準備
+        if not silent:
+            print("[2/5] モデル初期化中...")
         env = self.make_env()
         actions = list(range(env.action_space.n))
         s = env.reset()
@@ -306,6 +316,8 @@ class EvolutionalTrainer():
         self.weights = agent.model.get_weights()
         
         # 並列処理設定（一度だけ初期化して再利用）
+        if not silent:
+            print("[3/5] 並列評価エンジン準備中...")
         parallel = Parallel(n_jobs=n_jobs, verbose=0, 
                           prefer="processes",
                           batch_size="auto",
@@ -313,7 +325,14 @@ class EvolutionalTrainer():
                           max_nbytes=None)
         
         # エポックごとの学習ループ
+        if not silent:
+            print(f"[4/5] 学習開始: {epoch}エポック x {self.population_size}個体")
+        
         for e in range(epoch):
+            if not silent:
+                print(f"\r  エポック {e+1}/{epoch}: 評価中...", end="")
+                sys.stdout.flush()
+                
             # 並列個体評価
             results = parallel(
                 delayed(self.__class__.experiment)(
@@ -323,9 +342,15 @@ class EvolutionalTrainer():
             
             # 結果を使って重みを更新
             self.update(results)
-            self.log()
+            
+            if not silent:
+                rewards = self.reward_log[-1]
+                print(f"\r  エポック {e+1}/{epoch}: 報酬 {rewards.mean():.1f} (最大:{rewards.max():.1f})")
 
-        # ここに追加: 訓練済みエージェントを返す
+        if not silent:
+            print("[5/5] 学習完了、モデル最終化中...")
+            
+        # 訓練済みエージェントを返す
         agent.model.set_weights(self.weights)
         return agent
 
@@ -523,20 +548,24 @@ class EvolutionalTrainer():
 # ===== メイン処理 =====
 def main(play, epochs, pop_size, sigma, lr, silent=False):
     """メインエントリポイント関数（学習または実行）"""
+    start_time = datetime.datetime.now()
+    
     # サイレントモード設定
     if silent:
-        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"  # TensorFlow警告抑制
+        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
         import warnings
-        warnings.filterwarnings('ignore')  # その他の警告抑制
+        warnings.filterwarnings('ignore')
+    else:
+        print(f"開始時刻: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
     # モデル保存パス設定
     model_path = os.path.join(os.path.dirname(__file__), "ev_agent.keras")
     
-    if play:  # プレイモード（学習済みモデルで実行）
+    if play:
         env = EvolutionalTrainer.make_env()
         agent = EvolutionalAgent.load(env, model_path)
         agent.play(env, episode_count=5, render=True)
-    else:  # 学習モード
+    else:
         # トレーナー初期化
         trainer = EvolutionalTrainer(
             population_size=pop_size,  # 集団サイズ
@@ -552,6 +581,13 @@ def main(play, epochs, pop_size, sigma, lr, silent=False):
         )
         trained.save(model_path)      # モデル保存
         
+        # 結果表示
+        if not silent:
+            end_time = datetime.datetime.now()
+            elapsed = end_time - start_time
+            print(f"総実行時間: {elapsed.total_seconds():.1f}秒")
+            print(f"モデル保存先: {model_path}")
+            
         # 結果の保存と表示（plotfileフォルダに保存）
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         result_filename = f"es_results_e{epochs}_p{pop_size}_s{sigma}_lr{lr}_{timestamp}.png"

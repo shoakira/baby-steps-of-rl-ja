@@ -82,7 +82,8 @@ class EvolutionalAgent():
         """モデル保存（.keras形式）"""
         if model_path.endswith('.h5'):
             model_path = model_path.replace('.h5', '.keras')
-        self.model.save(model_path, overwrite=True, save_format='keras')
+        # save_formatを削除するだけで解決
+        self.model.save(model_path, overwrite=True)
 
     @classmethod
     def load(cls, env, model_path):
@@ -253,6 +254,10 @@ class EvolutionalTrainer():
         import numpy as np
         import os
         
+        # 並列処理のデータ転送を最適化（新規追加）
+        import pickle
+        pickle.HIGHEST_PROTOCOL = 4  # シリアライズを高速化
+        
         # TensorFlow警告抑制
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
         
@@ -264,8 +269,8 @@ class EvolutionalTrainer():
         old_stdout = sys.stdout
         old_stderr = sys.stderr
         
-        # 全プロセスの出力を抑制（ログファイル汚染防止）
-        if p_index >= 0:  # ジョブインデックス0含む全プロセス
+        # 全プロセスの出力を抑制
+        if p_index >= 0:
             sys.stdout = open(os.devnull, 'w')
             sys.stderr = open(os.devnull, 'w')
         
@@ -286,11 +291,10 @@ class EvolutionalTrainer():
         """進化戦略によるエージェント訓練（メイン処理）"""
         # GPU/CPU検出と並列数決定
         is_using_gpu = any('GPU' in device.name for device in tf.config.list_physical_devices())
-        n_jobs = 4 if is_using_gpu else 7  # GPU使用時は少ない並列数で（リソース競合回避）
+        n_jobs = 4 if is_using_gpu else 7
         
-        # 実行モードの出力（silent=Trueなら抑制）
         if not silent:
-            print(f"{'GPU' if is_using_gpu else 'CPU'} モード: {n_jobs}並列で実行")
+            print(f"{'GPU計算 + ' if is_using_gpu else ''}CPU並列処理: {n_jobs}個のプロセスで評価")
 
         # 環境と基本エージェントの準備
         env = self.make_env()
@@ -298,21 +302,18 @@ class EvolutionalTrainer():
         s = env.reset()
         agent = EvolutionalAgent(actions)
         agent.initialize(s)
-        self.weights = agent.model.get_weights()  # 初期重みを保存
+        self.weights = agent.model.get_weights()
         
-        if not silent:
-            print(f"Using {n_jobs} CPU cores for parallel processing")
+        # 並列処理設定（一度だけ初期化して再利用）
+        parallel = Parallel(n_jobs=n_jobs, verbose=0, 
+                          prefer="processes",
+                          batch_size="auto",
+                          backend="multiprocessing",
+                          max_nbytes=None)
         
         # エポックごとの学習ループ
         for e in range(epoch):
-            # 並列処理設定（Mac M3向け最適化）
-            parallel = Parallel(n_jobs=n_jobs, verbose=0, 
-                              prefer="processes",      # プロセス並列（GIL回避）
-                              batch_size="auto",       # バッチ自動調整
-                              backend="multiprocessing", # 高速バックエンド
-                              max_nbytes=None)         # メモリ制限解除
-            
-            # 並列個体評価（population_size個のエージェント）
+            # 並列個体評価（毎回新しい並列処理を作らない）
             results = parallel(
                 delayed(self.__class__.experiment)(
                     i, self.weights, self.sigma, episode_per_agent
@@ -321,11 +322,7 @@ class EvolutionalTrainer():
             
             # 結果を使って重みを更新
             self.update(results)
-            self.log()  # エポック報告
-
-        # 訓練後の最終エージェントを生成
-        agent.model.set_weights(self.weights)
-        return agent
+            self.log()
 
     @classmethod
     def make_env(cls):
@@ -366,8 +363,10 @@ class EvolutionalTrainer():
                     step = 0
                     episode_reward = 0
                     
-                    # バッチ処理による高速化
-                    BATCH_SIZE = 4  # 一度に予測する状態数
+                    # バッチ処理のサイズを動的に調整（環境に応じて）
+                    import psutil
+                    avail_mem = psutil.virtual_memory().available / (1024 * 1024 * 1024)  # GB
+                    BATCH_SIZE = 8 if avail_mem > 4 else 4  # 利用可能メモリに基づく調整
                     
                     # エピソード実行
                     while not done and step < max_step:

@@ -48,7 +48,7 @@ import tensorflow as tf
 import tensorflow.keras as K
 
 # TensorFlow設定を最適化（ファイル冒頭に一度だけ実行）
-def configure_tensorflow():
+def configure_tensorflow(silent=False):
     # Apple Siliconの場合のみMPSを設定
     if platform.processor() == 'arm':
         # TensorFlow-Metal向け環境変数
@@ -56,9 +56,9 @@ def configure_tensorflow():
         
         # TF設定
         physical_devices = tf.config.list_physical_devices()
-        if any('GPU' in device.name for device in physical_devices):
-            print("MPS/GPU 加速が有効化されました")
-        else:
+        if any('GPU' in device.name for device in physical_devices) and not silent:
+            #print("MPS/GPU 加速が有効化されました")
+        elif not silent:
             print("CPU モードで実行します")
 
         # スレッド最適化
@@ -232,35 +232,41 @@ class EvolutionalTrainer():
         import numpy as np
         import os
         
-        # 子プロセスではTensorFlowの警告を完全に無効化
+        # すべてのプロセスで警告を完全に無効化
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
         
         # 乱数シードを設定して独立性を確保
         seed = int(time.time() * 1000000) % (2**32) + p_index
         np.random.seed(seed)
         
-        # 余計な出力を全て抑制（標準出力のリダイレクト）
-        if p_index > 0:  # メインプロセス以外は出力を完全に抑制
+        # すべてのプロセス（メイン含む）で出力を抑制
+        old_stdout = sys.stdout
+        old_stderr = sys.stderr
+        
+        # メインプロセスも含めて全ての出力を抑制
+        if p_index >= 0:  # 全てのプロセスで出力を抑制
             sys.stdout = open(os.devnull, 'w')
-            sys.stderr = open(os.devnull, 'w')  # 標準エラー出力も抑制
+            sys.stderr = open(os.devnull, 'w')
         
         try:
             result = cls.run_agent(episode_per_agent, weights, sigma)
         finally:
-            # 出力を元に戻す
-            if p_index > 0:
+            # 出力を元に戻す（メインプロセスのみ）
+            if p_index == 0:  # メインプロセスの場合のみ出力を戻す
                 sys.stdout.close()
-                sys.stdout = sys.__stdout__
+                sys.stdout = old_stdout
                 sys.stderr.close()
-                sys.stderr = sys.__stderr__
-                
+                sys.stderr = old_stderr
+            
         return result
 
-    def train(self, epoch=100, episode_per_agent=1, render=False):
+    def train(self, epoch=100, episode_per_agent=1, render=False, silent=False):
         # GPU使用時は並列数を調整
         is_using_gpu = any('GPU' in device.name for device in tf.config.list_physical_devices())
         n_jobs = 4 if is_using_gpu else 7  # GPU使用時は並列数を減らす
-        print(f"{'GPU' if is_using_gpu else 'CPU'} モード: {n_jobs}並列で実行")
+        
+        if not silent:
+            print(f"{'GPU' if is_using_gpu else 'CPU'} モード: {n_jobs}並列で実行")
 
         env = self.make_env()
         actions = list(range(env.action_space.n))
@@ -268,11 +274,10 @@ class EvolutionalTrainer():
         agent = EvolutionalAgent(actions)
         agent.initialize(s)
         self.weights = agent.model.get_weights()
-
-        # CPUコア数を取得してMac向けに最適化
-        import multiprocessing
-        n_jobs = 7  # M3チップの8コア中7コアを使用
-        print(f"Using {n_jobs} CPU cores for parallel processing")
+        
+        # ここを修正: silentパラメータでメッセージを制御
+        if not silent:
+            print(f"Using {n_jobs} CPU cores for parallel processing")
         
         # 各エポックで並列処理を実行
         for e in range(epoch):
@@ -438,23 +443,30 @@ class EvolutionalTrainer():
         plt.show()
 
 
-def main(play, epochs, pop_size, sigma, lr):
-    model_path = os.path.join(os.path.dirname(__file__), "ev_agent.h5")
+def main(play, epochs, pop_size, sigma, lr, silent=False):
+    # サイレントモードの場合は余計な出力を最初から抑制
+    if silent:
+        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+        import warnings
+        warnings.filterwarnings('ignore')
 
+    model_path = os.path.join(os.path.dirname(__file__), "ev_agent.h5")
+    # 以下略...
     if play:
         env = EvolutionalTrainer.make_env()
         agent = EvolutionalAgent.load(env, model_path)
         agent.play(env, episode_count=5, render=True)
     else:
         trainer = EvolutionalTrainer(
-            population_size=pop_size,  # より多くの個体で探索
-            sigma=sigma,               # ノイズの大きさを調整
-            learning_rate=lr,          # 学習率を調整
+            population_size=pop_size,
+            sigma=sigma,
+            learning_rate=lr,
             report_interval=5
         )
         trained = trainer.train(
-            epoch=epochs,              # より多くのエポックで学習
-            episode_per_agent=5        # 各エージェントをより多くのエピソードで評価
+            epoch=epochs,
+            episode_per_agent=5,
+            silent=silent  # silentフラグを渡す
         )
         trained.save(model_path)
         trainer.plot_rewards()
@@ -476,4 +488,8 @@ if __name__ == "__main__":
         warnings.filterwarnings('ignore')
         os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
     
-    main(args.play, args.epochs, args.pop_size, args.sigma, args.lr)
+    # silentフラグに基づいてTensorFlow設定を構成
+    configure_tensorflow(silent=args.silent)
+    
+    # メインにsilentフラグを渡す
+    main(args.play, args.epochs, args.pop_size, args.sigma, args.lr, args.silent)

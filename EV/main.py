@@ -27,7 +27,40 @@ import numpy as np
 import gymnasium as gym
 import tensorflow as tf
 
-# 内部モジュール（早期インポートを避けるため関数内でインポート）
+
+def setup_silent_mode(silent: bool) -> None:
+    """サイレントモードの設定
+    
+    警告やログ出力を抑制します
+    
+    Args:
+        silent: 出力を抑制するかどうか
+    """
+    if silent:
+        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+        warnings.filterwarnings('ignore')
+
+
+def setup_tensorflow(silent: bool) -> None:
+    """TensorFlow環境の設定
+    
+    GPUの初期化とメモリ設定を行います
+    
+    Args:
+        silent: 出力を抑制するかどうか
+    """
+    from utils import configure_tensorflow
+    configure_tensorflow(silent=silent)
+
+
+def get_model_path() -> str:
+    """モデル保存パスを取得
+    
+    Returns:
+        str: モデル保存先のフルパス
+    """
+    from config import Config
+    return Config.get_model_path()
 
 
 def setup_environment(silent: bool = False) -> Tuple[datetime.datetime, str]:
@@ -39,25 +72,58 @@ def setup_environment(silent: bool = False) -> Tuple[datetime.datetime, str]:
     Returns:
         開始時刻とモデルパス
     """
-    from config import Config
-    from utils import configure_tensorflow
-    
     start_time = datetime.datetime.now()
     
     # サイレントモード設定
-    if silent:
-        os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-        warnings.filterwarnings('ignore')
-    else:
+    setup_silent_mode(silent)
+    
+    if not silent:
         print(f"開始時刻: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # TensorFlow設定（GPUの初期化など）
-    configure_tensorflow(silent=silent)
+    # TensorFlow設定
+    setup_tensorflow(silent)
     
     # モデル保存パス設定
-    model_path = Config.get_model_path()
+    model_path = get_model_path()
     
     return start_time, model_path
+
+
+def _generate_result_filename(trainer, timestamp=None) -> str:
+    """学習結果のファイル名を生成
+    
+    Args:
+        trainer: トレーナーオブジェクト
+        timestamp: タイムスタンプ（Noneの場合は現在時刻）
+        
+    Returns:
+        str: 結果ファイル名
+    """
+    if timestamp is None:
+        timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        
+    epochs = len(trainer.reward_log)
+    pop_size = trainer.population_size
+    sigma = trainer.sigma
+    lr = trainer.learning_rate
+    
+    return f"es_results_e{epochs}_p{pop_size}_s{sigma}_lr{lr}_{timestamp}.png"
+
+
+def get_memory_usage() -> Optional[Tuple[float, str]]:
+    """現在のメモリ使用量を取得
+    
+    Returns:
+        Optional[Tuple[float, str]]: (使用メモリMB, フォーマット済み文字列) またはNone
+    """
+    try:
+        import psutil
+        process = psutil.Process()
+        memory_info = process.memory_info()
+        memory_mb = memory_info.rss / (1024 * 1024)
+        return memory_mb, f"メモリ使用量: {memory_mb:.1f} MB"
+    except ImportError:
+        return None
 
 
 def play_agent(model_path: str) -> None:
@@ -84,6 +150,8 @@ def train_agent(
     pop_size: int, 
     sigma: float, 
     lr: float, 
+    cores: Optional[int] = None,
+    force_cpu: bool = False,
     silent: bool = False
 ) -> Dict[str, Any]:
     """エージェントを学習し、結果を返す
@@ -93,6 +161,8 @@ def train_agent(
         pop_size: 集団サイズ
         sigma: ノイズ幅
         lr: 学習率
+        cores: 使用するCPUコア数（Noneの場合は自動）
+        force_cpu: CPUのみを強制使用するフラグ
         silent: サイレントフラグ
         
     Returns:
@@ -102,7 +172,16 @@ def train_agent(
     from agent import EvolutionalAgent
     from trainer import EvolutionalTrainer
     
+    # 環境セットアップ
     start_time, model_path = setup_environment(silent)
+    
+    # CPU専用モード設定（オプション）
+    if force_cpu:
+        Config.force_cpu_mode()
+        
+    # コア数設定（オプション）
+    if cores is not None:
+        Config.OVERRIDE_CORES = cores
     
     try:
         # トレーナー初期化
@@ -116,7 +195,7 @@ def train_agent(
         # 学習実行
         trained = trainer.train(
             epoch=epochs,
-            episode_per_agent=Config.DEFAULT_EPISODE_PER_AGENT,
+            episode_per_agent=Config.DEFAULT_EPISODE_PER_AGENT, 
             silent=silent
         )
         
@@ -167,15 +246,10 @@ def display_results(results: Dict[str, Any], silent: bool = False) -> None:
     print(f"総実行時間: {elapsed.total_seconds():.1f}秒")
     print(f"モデル保存先: {model_path}")
     
-    # メモリ使用状況を表示（オプション）
-    try:
-        import psutil
-        process = psutil.Process()
-        memory_info = process.memory_info()
-        print(f"メモリ使用量: {memory_info.rss / (1024 * 1024):.1f} MB")
-    except ImportError:
-        # psutilがインストールされていない場合は表示しない
-        pass
+    # メモリ使用状況を表示
+    memory_info = get_memory_usage()
+    if memory_info:
+        print(memory_info[1])
     
     # 結果の保存と表示
     try:
@@ -191,19 +265,22 @@ def display_results(results: Dict[str, Any], silent: bool = False) -> None:
                 y_max = 350  # 中程度の報酬時
             
             # 一意のファイル名で結果を保存
-            timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-            epochs = len(reward_data)
-            pop_size = trainer.population_size
-            sigma = trainer.sigma
-            lr = trainer.learning_rate
-            
-            result_filename = f"es_results_e{epochs}_p{pop_size}_s{sigma}_lr{lr}_{timestamp}.png"
+            result_filename = _generate_result_filename(trainer)
             trainer.plot_rewards(result_filename, y_max=y_max)
     except Exception as e:
         print(f"警告: 結果の表示中にエラーが発生しました: {e}")
 
 
-def main(play: bool, epochs: int, pop_size: int, sigma: float, lr: float, silent: bool = False) -> None:
+def main(
+    play: bool, 
+    epochs: int, 
+    pop_size: int, 
+    sigma: float, 
+    lr: float, 
+    cores: Optional[int] = None,
+    force_cpu: bool = False,
+    silent: bool = False
+) -> None:
     """メインエントリポイント関数
     
     Args:
@@ -212,6 +289,8 @@ def main(play: bool, epochs: int, pop_size: int, sigma: float, lr: float, silent
         pop_size: 集団サイズ
         sigma: ノイズ幅
         lr: 学習率
+        cores: 使用するCPUコア数
+        force_cpu: CPU専用モードフラグ
         silent: サイレントフラグ
     """
     try:
@@ -229,7 +308,7 @@ def main(play: bool, epochs: int, pop_size: int, sigma: float, lr: float, silent
             play_agent(model_path)
         else:
             # 学習モード
-            results = train_agent(epochs, pop_size, sigma, lr, silent)
+            results = train_agent(epochs, pop_size, sigma, lr, cores, force_cpu, silent)
             display_results(results, silent)
             
     except Exception as e:
@@ -266,10 +345,21 @@ if __name__ == "__main__":
     parser.add_argument("--pop-size", type=int, default=Config.DEFAULT_POPULATION_SIZE, help="集団サイズ")
     parser.add_argument("--sigma", type=float, default=Config.DEFAULT_SIGMA, help="探索のノイズ幅")
     parser.add_argument("--lr", type=float, default=Config.DEFAULT_LEARNING_RATE, help="学習率")
-    parser.add_argument("--silent", action="store_true", help="警告を抑制")
+    parser.add_argument("--cores", type=int, default=None, help="使用するCPUコア数")
+    parser.add_argument("--force-cpu", action="store_true", help="CPU専用モードを強制")
+    parser.add_argument("--silent", action="store_true", help="出力を抑制")
 
     # 引数解析
     args = parser.parse_args()
     
     # メイン処理実行
-    main(args.play, args.epochs, args.pop_size, args.sigma, args.lr, args.silent)
+    main(
+        args.play, 
+        args.epochs, 
+        args.pop_size, 
+        args.sigma, 
+        args.lr, 
+        args.cores, 
+        args.force_cpu, 
+        args.silent
+    )

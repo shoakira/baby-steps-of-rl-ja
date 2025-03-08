@@ -17,13 +17,24 @@ class EvolutionalTrainer:
     """進化戦略（ES）アルゴリズムによるエージェント訓練の基本クラス"""
     
     def __init__(self, population_size=20, sigma=0.5, learning_rate=0.1,
-                 report_interval=10, timeout_seconds=90):
-        """初期化"""
+                 report_interval=10, timeout_seconds=None):
+        """初期化
+        
+        Args:
+            population_size (int): 1世代あたりの個体数
+            sigma (float): ノイズの標準偏差
+            learning_rate (float): 更新率
+            report_interval (int): 報告間隔
+            timeout_seconds (float, optional): タイムアウト時間（指定がなければConfigから取得）
+        """
+        from config import Config
+        
         self.population_size = population_size
         self.sigma = sigma
         self.learning_rate = learning_rate
         self.report_interval = report_interval
-        self.timeout_seconds = timeout_seconds
+        # タイムアウトはConfigから取得（オーバーライド可能）
+        self.timeout_seconds = timeout_seconds or Config.get_evaluation_timeout()
         self.weights = ()
         self.reward_log = []
         
@@ -61,6 +72,32 @@ class EvolutionalTrainer:
         agent.model.set_weights(self.weights)
         return agent
     
+    def _get_device_info(self):
+        """実行デバイス情報を取得
+        
+        Returns:
+            tuple: (GPU使用フラグ, 並列ジョブ数, デバイス詳細情報)
+        """
+        # GPU/CPU検出
+        gpus = tf.config.list_physical_devices('GPU')
+        mps_device = any('MPS' in d.name for d in tf.config.list_physical_devices())
+        is_using_gpu = len(gpus) > 0 or mps_device
+        
+        # 並列ジョブ数
+        n_jobs = self._get_optimal_job_count()
+        
+        # デバイス詳細
+        device_info = ""
+        if is_using_gpu:
+            if mps_device:
+                device_info = "Apple Silicon GPU (MPS)"
+            else:
+                device_info = f"NVIDIA GPU ({len(gpus)}基)"
+        else:
+            device_info = f"CPU ({n_jobs}コア)"
+        
+        return is_using_gpu, n_jobs, device_info
+
     def _print_training_start_info(self, epoch):
         """学習開始情報の表示"""
         print("===== 進化戦略学習を開始します =====")
@@ -68,9 +105,8 @@ class EvolutionalTrainer:
         print(f"探索パラメータ: σ={self.sigma}, 学習率={self.learning_rate}")
         
         # GPU/CPU検出と表示
-        is_using_gpu = any('GPU' in d.name for d in tf.config.list_physical_devices())
-        n_jobs = min(4, self._get_optimal_job_count())
-        print(f"[1/5] 環境準備: {'GPU + ' if is_using_gpu else ''}CPU並列: {n_jobs}個")
+        is_using_gpu, n_jobs, device_info = self._get_device_info()
+        print(f"[1/5] 環境準備: {device_info} で並列処理: {n_jobs}個")
         print("[2/5] モデル初期化中...")
     
     def _prepare_agent(self, env):
@@ -85,16 +121,23 @@ class EvolutionalTrainer:
         return agent
     
     def _create_parallel_executor(self, worker_count):
-        """並列実行エンジンの作成"""
-        print("[3/5] 並列評価エンジン準備中...")
+        """並列実行エンジンの作成
+        
+        Args:
+            worker_count: Configから取得した最適な並列プロセス数
+            
+        Returns:
+            Parallel: 並列処理エンジン
+        """
+        print(f"[3/5] 並列評価エンジン準備中... ({worker_count}コア)")
+        
         return Parallel(
-            n_jobs=min(worker_count, 4),
+            n_jobs=worker_count,  # 並列度をより多く
             verbose=0,
-            prefer="processes",
-            batch_size=1,
-            timeout=self.timeout_seconds * 1.5,
-            backend="multiprocessing",
-            max_nbytes=None
+            prefer="threads",     # スレッドベースの並列処理
+            timeout=self.timeout_seconds,
+            backend="threading",  # スレッドバックエンド
+            max_nbytes="1M"       # メモリ制限
         )
     
     def _run_single_epoch(self, e, epoch, parallel, episode_per_agent, train_start, silent):
@@ -122,11 +165,26 @@ class EvolutionalTrainer:
             print(f"\r  エポック {e+1}/{epoch}: 報酬 {rewards.mean():.1f} (最大:{rewards.max():.1f})")
     
     def _evaluate_population(self, parallel, episode_per_agent):
-        """集団全体の並列評価"""
+        """集団の評価を並列実行（重みのみ送信）
+        
+        各プロセスで独立してエージェントを作成し、pickle化の問題を回避します
+        
+        Args:
+            parallel: 並列実行エンジン
+            episode_per_agent: 個体あたりエピソード数
+            
+        Returns:
+            評価結果リスト [(報酬リスト, 個体インデックス), ...]
+        """
+        # 現在のベース重みを取得
+        base_weights = self.weights
+        
+        # 重みとシグマだけを渡して並列評価
         return parallel(
-            delayed(EvaluationWorker.evaluate)(
-                i, self.weights, self.sigma, episode_per_agent, self.timeout_seconds
-            ) for i in range(self.population_size)
+            delayed(EvaluationWorker.evaluate_weights)(
+                p_index, episode_per_agent, base_weights, self.sigma, self.timeout_seconds
+            )
+            for p_index in range(self.population_size)
         )
     
     def _update_weights(self, agent_results):
@@ -149,6 +207,19 @@ class EvolutionalTrainer:
             self.learning_rate
         )
         return plotter.plot(save_path, y_max)
+
+    def _get_population_weights(self):
+        """集団の個体（重み）を生成
+        
+        各個体は同じベース重みから始まり、評価時にノイズが加えられます
+        
+        Returns:
+            list: 個体（重み）のリスト
+        """
+        population = []
+        for _ in range(self.population_size):
+            population.append(self.weights)
+        return population
 
 
 # =============== 並列評価ワーカー ===============
@@ -202,13 +273,49 @@ class EvaluationWorker:
             cls._log_progress(p_index, "タイムアウト!")
             raise TimeoutError("評価タイムアウト")
         
-        timer = threading.Timer(timeout_seconds, timeout_handler)
+        timer = threading.Timer(timeout_seconds * 1.5, timeout_handler)
         return timer, timeout_handler
     
+    # _run_single_epoch メソッド内で EvaluationWorker の初期化時にフラグ設定
+
+    @classmethod
+    def evaluate(cls, p_index, episode_per_agent, agent, weights, env, timeout_seconds):
+        """パラメーターセットの評価
+        
+        Args:
+            p_index: 並列処理インデックス
+            episode_per_agent: 個体あたりエピソード数
+            agent: エージェントインスタンス
+            weights: 評価する重み
+            env: 環境
+            timeout_seconds: タイムアウト時間
+            
+        Returns:
+            (報酬リスト, 個体インデックス)
+        """
+        # タイムアウト機構をセットアップ
+        timer, timeout_handler = cls._setup_timeout(p_index, timeout_seconds)
+        timer.start()
+        
+        # 並列処理時のログ制御用フラグ
+        agent.is_main_process = (p_index == 0)
+        
+        # 以下は既存の処理...
+
+    # 3. EvaluationWorker._log_progress の改善
     @classmethod
     def _log_progress(cls, p_index, message):
-        """プロセスの進捗表示（メインプロセスのみ）"""
-        if p_index == 0:
+        """プロセスの進捗表示
+        
+        並列処理時には標準出力が競合するため、メインプロセス(p_index=0)の
+        メッセージのみを表示します。これにより処理状況を確認しつつ、
+        ログの混乱を防止します。
+        
+        Args:
+            p_index (int): プロセスインデックス (0がメインプロセス)
+            message (str): 表示するメッセージ
+        """
+        if p_index == 0:  # メインプロセスのみ出力
             sys.stdout.write(f"\r      個体{p_index}: {message}")
             sys.stdout.flush()
     
@@ -290,6 +397,88 @@ class EvaluationWorker:
         except Exception as e:
             print(f"エピソード実行エラー: {e}")
             return None, 0
+
+    @classmethod
+    def evaluate_weights(cls, p_index, episode_per_agent, base_weights, sigma, timeout_seconds):
+        """重みのみを受け取って評価する方法
+        
+        各プロセスで新たにエージェントを作成するため、pickle化問題を回避できます
+        
+        Args:
+            p_index: 並列処理インデックス
+            episode_per_agent: 個体あたりエピソード数
+            base_weights: ベース重み
+            sigma: ノイズ幅
+            timeout_seconds: タイムアウト時間
+        """
+        from agent import EvolutionalAgent
+        from environment import CartPoleVectorObserver
+        from config import Config
+        
+        # 独立した乱数シード設定
+        np.random.seed(int(time.time() * 1000000) % (2**32) + p_index)
+        
+        # タイムアウト機構
+        timer, timeout_handler = cls._setup_timeout(p_index, timeout_seconds)
+        
+        try:
+            # ログ表示
+            cls._log_progress(p_index, "評価中...")
+            timer.start()
+            
+            # ノイズを生成して重みに加える
+            noises = []
+            noisy_weights = []
+            for w in base_weights:
+                noise = np.random.randn(*w.shape)
+                noisy_weights.append(w + sigma * noise)
+                noises.append(noise)
+            
+            # 環境とエージェント作成（各プロセスで独立）
+            env = CartPoleVectorObserver()
+            agent = EvolutionalAgent(list(range(env.action_space.n)))
+            s = env.reset()
+            
+            # ノイズ付き重みでエージェント初期化
+            agent.is_main_process = (p_index == 0)  # メインプロセスフラグ
+            agent.initialize(s, weights=noisy_weights)
+            
+            # エピソード実行
+            total_reward = 0
+            episode_count = 0
+            detailed_logs = []
+            
+            for e in range(episode_per_agent):
+                s = env.reset()
+                done = False
+                step = 0
+                episode_reward = 0
+                
+                while not done and step < Config.MAX_STEPS_PER_EPISODE:
+                    a = agent.policy(s)
+                    n_state, reward, done, info = env.step(a)
+                    episode_reward += reward
+                    s = n_state
+                    step += 1
+                
+                detailed_logs.append(f"エピソード{e+1}: {step}ステップ, 報酬{episode_reward:.1f}")
+                total_reward += episode_reward
+                episode_count += 1
+            
+            # 結果計算
+            avg_reward = total_reward / max(episode_count, 1)
+            details = " | ".join(detailed_logs)
+            
+            timer.cancel()
+            cls._log_progress(p_index, f"完了: {details[:60]}...")
+            
+            # 修正: 二重タプルではなく単一のタプルを返す
+            return avg_reward, noises  # detailsは返さない
+            
+        except Exception as e:
+            cls._log_progress(p_index, f"エラー: {str(e)[:30]}")
+            timer.cancel()
+            return 0, [np.zeros_like(w) for w in base_weights]
 
 
 # =============== 重み更新クラス ===============

@@ -7,6 +7,7 @@ import numpy as np
 import tensorflow as tf
 import tensorflow.keras as K
 import sys
+import time
 
 class EvolutionalAgent:
     """進化戦略で学習するエージェント"""
@@ -18,6 +19,7 @@ class EvolutionalAgent:
         self.actions = actions  # 行動空間
         self.model = None      # NNモデル
         self._predict_fn = None  # 高速推論用キャッシュ
+        self.is_main_process = True  # デフォルトではメインプロセスとみなす
         
     def save(self, model_path):
         """モデル保存（.keras形式）
@@ -40,6 +42,8 @@ class EvolutionalAgent:
         Returns:
             EvolutionalAgent: 読み込まれたエージェント
         """
+        from config import Config
+        
         # 拡張子の自動検出
         if model_path.endswith('.h5') and not os.path.exists(model_path):
             keras_path = model_path.replace('.h5', '.keras')
@@ -51,22 +55,45 @@ class EvolutionalAgent:
         agent = cls(actions)
         agent.model = K.models.load_model(model_path)
         
-        # 高速推論関数の設定（読み込み時に初期化）
-        @tf.function(reduce_retracing=True)
-        def predict_fn(x):
-            return agent.model(x, training=False)
-        
-        agent._predict_fn = predict_fn
-        
-        # ウォームアップ推論
-        dummy_input = np.zeros((1, env.observation_space.shape[0]), dtype=np.float32)
-        try:
-            agent._predict_fn(tf.convert_to_tensor(dummy_input))
-        except Exception as e:
-            print(f"警告: GPU推論初期化エラー。CPU推論に切り替えます: {e}")
-            agent._predict_fn = lambda x: agent.model.predict(x, verbose=0)
+        # 推論関数の設定とウォームアップ
+        state_shape = env.observation_space.shape[0]
+        dummy_state = np.zeros((1, state_shape), dtype=np.float32)
+        agent._setup_predict_fn(dummy_state, is_load=True)
         
         return agent
+
+    def _setup_predict_fn(self, state, is_load=False):
+        """推論関数の設定とウォームアップ"""
+        from config import Config
+        
+        # JIT最適化を無効化し、シンプルな関数呼び出しに置き換え
+        # 並列処理時のPickle化問題を回避し、安定性を向上
+        self._predict_fn = lambda x: self.model(x, training=False)
+        
+        # ウォームアップ推論（シンプル版）
+        try:
+            # テンポラル表示 - 並列処理時に出力が混乱するので条件を厳格化
+            show_logs = not is_load and hasattr(self, 'is_main_process') and self.is_main_process
+            start_time = time.time()
+            
+            # ウォームアップ用入力の準備
+            dummy_input = np.zeros((1, len(state)), dtype=np.float32)
+            tensor_input = tf.convert_to_tensor(dummy_input)
+            
+            # 1回だけ実行（グラフコンパイルなし）
+            _ = self._predict_fn(tensor_input)
+            
+            # 完了表示
+            elapsed = time.time() - start_time
+            if show_logs:
+                print(f"\rモデル初期化完了: {elapsed:.3f}秒" + " " * 20)
+                
+        except Exception as e:
+            # エラー表示もメインプロセスのみ
+            if not is_load and hasattr(self, 'is_main_process') and self.is_main_process:
+                print(f"警告: 推論初期化エラー。標準推論に切り替えます: {e}")
+            # エラー時は標準推論（verbose=0でメッセージを抑制）
+            self._predict_fn = lambda x: self.model.predict(x, verbose=0)
 
     def initialize(self, state, weights=()):
         """ニューラルネットワークモデルの初期化
@@ -78,6 +105,12 @@ class EvolutionalAgent:
         from config import Config
         import time
         
+        # 並列処理時はCPUモードを強制（GPU競合回避）
+        if not hasattr(self, 'is_main_process') or not self.is_main_process:
+            os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
+            os.environ['TF_DISABLE_GPU'] = '1'
+            os.environ['DISABLE_MPS'] = '1'  # Apple Silicon MPS も無効化
+        
         # 2層ニューラルネット構築
         normal = K.initializers.GlorotNormal()  # Xavier初期化
         inputs = K.Input(shape=(len(state),), dtype=tf.float32)
@@ -85,15 +118,23 @@ class EvolutionalAgent:
         x = K.layers.Dense(Config.HIDDEN_LAYER_SIZE, activation="relu", kernel_initializer=normal)(x)
         outputs = K.layers.Dense(len(self.actions), activation="softmax")(x)
         
-        # 混合精度を有効化（FP16とFP32）- パフォーマンス向上
-        policy = tf.keras.mixed_precision.Policy('float32')
+        # 混合精度設定
+        # float32はApple SiliconのMPS互換性のため使用（float16より安定）
+        # 本番環境ではConfig.USE_MIXED_PRECISIONで制御
+        if Config.USE_MIXED_PRECISION:
+            policy = tf.keras.mixed_precision.Policy('mixed_float16')
+        else:
+            policy = tf.keras.mixed_precision.Policy('float32')
         tf.keras.mixed_precision.set_global_policy(policy)
         
+        # モデル作成
         model = K.Model(inputs=inputs, outputs=outputs)
         self.model = model
         
-        # モデルサマリー出力（デバッグ用）
-        # print(f"モデルサマリー:\n{model.summary()}")
+        # モデルサマリー出力（デバッグモード時のみ）
+        if Config.DEBUG_MODEL_SUMMARY:
+            print(f"モデルサマリー:")
+            model.summary()
         
         # 既存の重みがあれば設定
         if len(weights) > 0:
@@ -103,44 +144,8 @@ class EvolutionalAgent:
         optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
         self.model.compile(optimizer=optimizer, loss='categorical_crossentropy')
         
-        # 高速推論関数（tf.function で最適化）
-        @tf.function(reduce_retracing=True)
-        def predict_fn(x):
-            return self.model(x, training=False)
-            
-        self._predict_fn = predict_fn
-        
-        # ウォームアップ推論（GPU初期化、エラー時はCPU推論へフォールバック）
-        try:
-            # テンポラル表示に変更
-            sys.stdout.write("\rモデル初期化中: ウォームアップ推論を実行...")
-            sys.stdout.flush()
-            start_time = time.time()
-            
-            # 複数回のウォームアップ実行で初期化を確実に
-            dummy_input = np.zeros((1, len(state)), dtype=np.float32)
-            tensor_input = tf.convert_to_tensor(dummy_input)
-            
-            # 3回繰り返してコンパイルを確実に
-            for i in range(3):
-                _ = self._predict_fn(tensor_input)
-                # 進捗をテンポラル表示
-                sys.stdout.write(f"\rモデル初期化中: ウォームアップ推論 {i+1}/3 実行中...")
-                sys.stdout.flush()
-            
-            # 完了表示（最終行はクリアしない）
-            elapsed = time.time() - start_time
-            # メインスレッド/プロセスのみ表示（オプション）
-            if hasattr(self, 'is_main_process') and self.is_main_process:
-                print(f"\rモデル初期化完了: {elapsed:.3f}秒           ")
-            else:
-                # 何も表示しない（必要に応じてコメントアウト）
-                pass
-                
-        except Exception as e:
-            print(f"警告: GPU推論初期化エラー。CPU推論に切り替えます: {e}")
-            # CPU推論ではverbose=0でメッセージを抑制
-            self._predict_fn = lambda x: self.model.predict(x, verbose=0)
+        # 推論関数の設定とウォームアップ
+        self._setup_predict_fn(state)
 
     def policy(self, state):
         """状態から確率的に行動を選択

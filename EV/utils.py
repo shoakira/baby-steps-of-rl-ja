@@ -122,3 +122,86 @@ def get_memory_usage() -> Tuple[float, str]:
         return memory_mb, f"メモリ使用量: {memory_mb:.1f} MB"
     except ImportError:
         return 0.0, "メモリ使用量: 不明 (psutilがインストールされていません)"
+
+
+class RealtimePlotter:
+    """リアルタイムで学習曲線を表示するプロッター"""
+    
+    def __init__(self, title="Evolution Strategy Learning Curve", figsize=(10, 6)):
+        """初期化
+        
+        Args:
+            title: グラフのタイトル
+            figsize: 図のサイズ
+        """
+        import matplotlib.pyplot as plt
+        import numpy as np
+        
+        # インタラクティブモードを有効化
+        plt.ion()
+        
+        # 図とアックス初期化
+        self.fig, self.ax = plt.subplots(figsize=figsize)
+        self.ax.set_title(title)
+        self.ax.set_xlabel('Epoch')
+        self.ax.set_ylabel('Reward')
+        
+        # データ保持用
+        self.epochs = []
+        self.mean_rewards = []
+        self.max_rewards = []
+        self.min_rewards = []
+        
+        # プロット用のライン
+        self.mean_line, = self.ax.plot([], [], 'b-', label='Mean Reward')
+        self.max_line, = self.ax.plot([], [], 'g-', label='Max Reward')
+        self.min_line, = self.ax.plot([], [], 'r-', label='Min Reward')
+        
+        # 凡例表示
+        self.ax.legend()
+        
+        # 初期表示
+        self.fig.tight_layout()
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+        
+    def update(self, epoch, rewards):
+        """プロットを更新
+        
+        Args:
+            epoch: 現在のエポック数
+            rewards: 現在のエポックの報酬配列
+        """
+        import numpy as np
+        
+        # データ追加
+        self.epochs.append(epoch)
+        self.mean_rewards.append(np.mean(rewards))
+        self.max_rewards.append(np.max(rewards))
+        self.min_rewards.append(np.min(rewards))
+        
+        # ラインデータ更新
+        self.mean_line.set_data(self.epochs, self.mean_rewards)
+        self.max_line.set_data(self.epochs, self.max_rewards)
+        self.min_line.set_data(self.epochs, self.min_rewards)
+        
+        # 軸の範囲を自動調整
+        self.ax.relim()
+        self.ax.autoscale_view()
+        
+        # Y軸の範囲を調整（最小値を0に設定）
+        y_min, y_max = self.ax.get_ylim()
+        self.ax.set_ylim(0, y_max * 1.1)
+        
+        # 描画更新
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+        
+    def save(self, filename):
+        """現在のプロットを保存
+        
+        Args:
+            filename: 保存先ファイル名
+        """
+        self.fig.savefig(filename)
+        print(f"学習曲線を保存しました: {filename}")

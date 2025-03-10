@@ -38,11 +38,25 @@ class EvolutionalTrainer:
         self.weights = ()
         self.reward_log = []
         
-    def train(self, epoch=100, episode_per_agent=1, render=False, silent=False):
-        """メイン学習ループ"""
+    def train(self, epoch=100, episode_per_agent=1, render=False, silent=False, realtime_plot=False):
+        """メイン学習ループ
+        
+        Args:
+            epoch: 学習エポック数
+            episode_per_agent: エージェントあたりのエピソード数
+            render: レンダリングを行うか
+            silent: 出力を抑制するか
+            realtime_plot: リアルタイムプロットを表示するか
+        """
         from environment import CartPoleVectorObserver
         from agent import EvolutionalAgent
         from config import Config
+        
+        # リアルタイムプロッター初期化
+        plotter = None
+        if realtime_plot and not silent:
+            from utils import RealtimePlotter
+            plotter = RealtimePlotter(title=f"Evolution Strategy (Pop={self.population_size}, σ={self.sigma}, η={self.learning_rate})")
         
         # 初期化と環境準備
         train_start = time.time()
@@ -65,11 +79,21 @@ class EvolutionalTrainer:
             # 個体評価と重み更新
             self._run_single_epoch(e, epoch, parallel, episode_per_agent, train_start, silent)
             
+            # リアルタイムプロット更新
+            if plotter and len(self.reward_log) > 0:
+                plotter.update(e+1, self.reward_log[-1])
+        
         # 学習完了
         if not silent:
             print("[5/5] 学習完了、モデル最終化中...")
             
         agent.model.set_weights(self.weights)
+        
+        # プロット保存
+        if plotter:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            plotter.save(f"es_realtime_e{epoch}_p{self.population_size}_s{self.sigma}_lr{self.learning_rate}_{timestamp}.png")
+            
         return agent
     
     def _get_device_info(self):

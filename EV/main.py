@@ -152,7 +152,8 @@ def train_agent(
     lr: float, 
     cores: Optional[int] = None,
     force_cpu: bool = False,
-    silent: bool = False
+    silent: bool = False,
+    realtime_plot: bool = False  # 引数を追加
 ) -> Dict[str, Any]:
     """エージェントを学習し、結果を返す
     
@@ -164,6 +165,7 @@ def train_agent(
         cores: 使用するCPUコア数（Noneの場合は自動）
         force_cpu: CPUのみを強制使用するフラグ
         silent: サイレントフラグ
+        realtime_plot: リアルタイムプロットを表示するかどうか
         
     Returns:
         学習結果の辞書（トレーナー、開始時刻など）
@@ -192,11 +194,12 @@ def train_agent(
             report_interval=5
         )
         
-        # 学習実行
+        # 学習実行 - リアルタイムプロットオプションを追加
         trained = trainer.train(
             epoch=epochs,
             episode_per_agent=Config.DEFAULT_EPISODE_PER_AGENT, 
-            silent=silent
+            silent=silent,
+            realtime_plot=realtime_plot  # 追加
         )
         
         # モデル保存
@@ -279,7 +282,8 @@ def main(
     lr: float, 
     cores: Optional[int] = None,
     force_cpu: bool = False,
-    silent: bool = False
+    silent: bool = False,
+    realtime_plot: bool = False  # 追加
 ) -> None:
     """メインエントリポイント関数
     
@@ -292,6 +296,7 @@ def main(
         cores: 使用するCPUコア数
         force_cpu: CPU専用モードフラグ
         silent: サイレントフラグ
+        realtime_plot: リアルタイムプロットを表示するかどうか
     """
     try:
         # コードが属するパスをシステムパスに追加（インポート問題を回避）
@@ -307,8 +312,8 @@ def main(
             _, model_path = setup_environment(silent)
             play_agent(model_path)
         else:
-            # 学習モード
-            results = train_agent(epochs, pop_size, sigma, lr, cores, force_cpu, silent)
+            # 学習モード - リアルタイムプロットフラグを追加
+            results = train_agent(epochs, pop_size, sigma, lr, cores, force_cpu, silent, realtime_plot)
             display_results(results, silent)
             
     except Exception as e:
@@ -348,6 +353,7 @@ if __name__ == "__main__":
     parser.add_argument("--cores", type=int, default=None, help="使用するCPUコア数")
     parser.add_argument("--force-cpu", action="store_true", help="CPU専用モードを強制")
     parser.add_argument("--silent", action="store_true", help="出力を抑制")
+    parser.add_argument("--realtime-plot", action="store_true", help="リアルタイムプロットを表示")
 
     # 引数解析
     args = parser.parse_args()
@@ -361,5 +367,6 @@ if __name__ == "__main__":
         args.lr, 
         args.cores, 
         args.force_cpu, 
-        args.silent
+        args.silent,
+        args.realtime_plot  # 引数を追加
     )
